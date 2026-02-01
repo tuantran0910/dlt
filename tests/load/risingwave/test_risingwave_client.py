@@ -1,0 +1,791 @@
+import pytest
+from unittest.mock import Mock, MagicMock, patch
+from typing import cast, Sequence, Any
+
+from dlt.destinations.impl.risingwave.typing import (
+    TABLE_APPEND_ONLY_HINT,
+    TABLE_ENGINE_HINT,
+    TABLE_PROPERTIES_HINT,
+)
+from dlt.destinations.impl.risingwave.risingwave import RisingwaveClient, RisingwaveLoadJob
+from dlt.destinations.impl.risingwave.risingwave_sql_client import RisingwaveSqlClient
+from dlt.destinations.impl.risingwave.configuration import (
+    RisingwaveCredentials,
+    RisingwaveClientConfiguration,
+)
+from dlt.destinations.impl.risingwave.factory import risingwave, _risingwave_file_format_selector
+from dlt.destinations.impl.postgres.configuration import PostgresClientConfiguration
+from dlt.common.configuration.specs import (
+    AwsCredentialsWithoutDefaults,
+    GcpServiceAccountCredentialsWithoutDefaults,
+    GcpOAuthCredentialsWithoutDefaults,
+    AzureCredentialsWithoutDefaults,
+)
+from dlt.common.schema import Schema, utils
+from dlt.common.schema.typing import TTableSchema, TFileFormat
+from dlt.common.typing import TLoaderFileFormat
+from dlt.common.destination.capabilities import DestinationCapabilitiesContext
+
+
+@pytest.fixture
+def risingwave_client_config() -> RisingwaveClientConfiguration:
+    config = RisingwaveClientConfiguration()
+    config.credentials = RisingwaveCredentials()
+    config.credentials.database = "test_db"
+    config.credentials.host = "localhost"
+    config.credentials.password = "password"
+    config.credentials.port = 4566
+    config.credentials.username = "root"
+    config.dataset_name = "test_dataset"
+    return config
+
+
+@pytest.fixture
+def schema_with_hints() -> Schema:
+    """Create a test schema with Risingwave-specific hints."""
+    import json
+
+    schema = Schema("test_schema")
+    schema.update_table(
+        utils.new_table(
+            "test_table",
+            json.dumps(
+                {
+                    "columns": {
+                        "id": {"name": "id", "data_type": "bigint", "nullable": False},
+                        "name": {"name": "name", "data_type": "text", "nullable": True},
+                        "created_at": {
+                            "name": "created_at",
+                            "data_type": "timestamp",
+                            "nullable": True,
+                        },
+                    },
+                    TABLE_ENGINE_HINT: "iceberg",
+                    TABLE_APPEND_ONLY_HINT: True,
+                    TABLE_PROPERTIES_HINT: {"timeline.timestamp_column": "created_at"},
+                }
+            ),
+        ),
+    )
+    return schema
+
+
+def test_risingwave_destination() -> None:
+    """Test that the risingwave destination is properly registered."""
+    from dlt.destinations import risingwave as risingwave_dest
+
+    assert risingwave_dest is not None
+    # risingwave is a Destination class (which is a metaclass), not an instance
+    assert hasattr(risingwave_dest, "__name__")
+    assert risingwave_dest.__name__ == "risingwave"
+
+
+def test_risingwave_capabilities() -> None:
+    """Test that Risingwave capabilities are properly configured."""
+    dest = risingwave()
+    capabilities = dest.capabilities()
+
+    assert capabilities is not None
+    assert capabilities.sqlglot_dialect == "postgres"
+    assert "insert_values" in capabilities.supported_loader_file_formats
+    assert "csv" in capabilities.supported_loader_file_formats
+    assert "parquet" in capabilities.supported_loader_file_formats
+    assert capabilities.supports_ddl_transactions is True
+
+
+def test_risingwave_type_mapper() -> None:
+    """Test that Risingwave type mapper is compatible with Risingwave types."""
+    dest = risingwave()
+    type_mapper = dest.capabilities().get_type_mapper()
+
+    # Test basic type mappings
+    assert (
+        type_mapper.to_destination_type({"name": "test_col", "data_type": "bigint"}, {}) == "bigint"
+    )
+    # Note: "text" maps to "varchar" without length (Risingwave doesn't support varchar with length)
+    assert (
+        type_mapper.to_destination_type({"name": "test_col", "data_type": "text"}, {}) == "varchar"
+    )
+    assert type_mapper.to_destination_type({"name": "test_col", "data_type": "json"}, {}) == "jsonb"
+
+    # Critical: Test that decimal/numeric does NOT include precision/scale
+    # Risingwave does not support numeric(precision, scale)
+    decimal_type = type_mapper.to_destination_type(
+        {"name": "test_col", "data_type": "decimal", "precision": 38, "scale": 2}, {}
+    )
+    assert decimal_type == "numeric", f"Expected 'numeric' but got '{decimal_type}'"
+    assert "(" not in decimal_type, "numeric should not have precision/scale specification"
+
+    # Test that wei also maps to numeric without precision/scale
+    wei_type = type_mapper.to_destination_type(
+        {"name": "test_col", "data_type": "wei", "precision": 76, "scale": 0}, {}
+    )
+    assert wei_type == "numeric", f"Expected 'numeric' but got '{wei_type}'"
+    assert "(" not in wei_type, "numeric should not have precision/scale specification"
+
+    # Test timestamp with precision - should work but not include precision
+    timestamp_type = type_mapper.to_destination_type(
+        {"name": "test_col", "data_type": "timestamp", "timezone": True, "precision": 6}, {}
+    )
+    # Risingwave uses "timestamp with time zone" without precision specification
+    assert "timestamp with time zone" in timestamp_type.lower()
+
+
+def test_risingwave_client_init(
+    risingwave_client_config: RisingwaveClientConfiguration,
+) -> None:
+    """Test RisingwaveClient initialization."""
+    schema = Schema("test_schema")
+    dest = risingwave()
+    capabilities = dest.capabilities()
+
+    # Client initialization doesn't require database connection
+    # It will connect when needed for operations
+    client = RisingwaveClient(schema, risingwave_client_config, capabilities)
+    assert client.config == risingwave_client_config
+    assert client.sql_client is not None
+
+
+def test_risingwave_create_indexes_default(
+    risingwave_client_config: RisingwaveClientConfiguration,
+) -> None:
+    """Test that create_indexes defaults to False."""
+    assert risingwave_client_config.create_indexes is False
+
+
+def test_risingwave_primary_key_with_create_indexes_disabled(
+    risingwave_client_config: RisingwaveClientConfiguration,
+) -> None:
+    """Test that PRIMARY KEY is NOT created when create_indexes=False (default)."""
+    schema = Schema("test_schema")
+    # Create table schema directly with primary_key hint
+    table_schema = {
+        "name": "test_table",
+        "columns": {
+            "id": {"name": "id", "data_type": "bigint", "nullable": False, "primary_key": True},
+            "name": {"name": "name", "data_type": "text", "nullable": True},
+        },
+        "write_disposition": "append",
+    }
+    schema._schema_tables["test_table"] = table_schema  # type: ignore[assignment]
+
+    dest = risingwave()
+    capabilities = dest.capabilities()
+    client = RisingwaveClient(schema, risingwave_client_config, capabilities)
+
+    columns = list(schema.tables["test_table"]["columns"].values())
+    sql_statements = client._get_table_update_sql("test_table", columns, generate_alter=False)
+    sql = sql_statements[0]
+
+    # Should NOT contain PRIMARY KEY when create_indexes=False
+    assert "PRIMARY KEY" not in sql
+
+
+def test_risingwave_primary_key_with_create_indexes_enabled() -> None:
+    """Test that PRIMARY KEY IS created when create_indexes=True."""
+    config = RisingwaveClientConfiguration()
+    config.credentials = RisingwaveCredentials()
+    config.credentials.database = "test_db"
+    config.credentials.host = "localhost"
+    config.credentials.password = "password"
+    config.credentials.port = 4566
+    config.credentials.username = "root"
+    config.create_indexes = True  # Enable PRIMARY KEY
+    config.dataset_name = "test_dataset"
+
+    schema = Schema("test_schema")
+    # Create table schema directly with primary_key hint
+    table_schema = {
+        "name": "test_table",
+        "columns": {
+            "id": {"name": "id", "data_type": "bigint", "nullable": False, "primary_key": True},
+            "name": {"name": "name", "data_type": "text", "nullable": True},
+        },
+        "write_disposition": "append",
+    }
+    schema._schema_tables["test_table"] = table_schema  # type: ignore[assignment]
+
+    dest = risingwave()
+    capabilities = dest.capabilities()
+    client = RisingwaveClient(schema, config, capabilities)
+
+    columns = list(schema.tables["test_table"]["columns"].values())
+    sql_statements = client._get_table_update_sql("test_table", columns, generate_alter=False)
+    sql = sql_statements[0]
+
+    # Should contain PRIMARY KEY when create_indexes=True
+    assert "PRIMARY KEY" in sql
+    assert "PRIMARY KEY (id)" in sql
+
+
+def test_risingwave_primary_key_multiple_columns() -> None:
+    """Test PRIMARY KEY with multiple columns."""
+    config = RisingwaveClientConfiguration()
+    config.credentials = RisingwaveCredentials()
+    config.credentials.database = "test_db"
+    config.credentials.host = "localhost"
+    config.credentials.password = "password"
+    config.credentials.port = 4566
+    config.credentials.username = "root"
+    config.create_indexes = True
+    config.dataset_name = "test_dataset"
+
+    schema = Schema("test_schema")
+    # Create table schema directly with multiple primary_key hints
+    table_schema = {
+        "name": "test_table",
+        "columns": {
+            "user_id": {
+                "name": "user_id",
+                "data_type": "bigint",
+                "nullable": False,
+                "primary_key": True,
+            },
+            "event_id": {
+                "name": "event_id",
+                "data_type": "bigint",
+                "nullable": False,
+                "primary_key": True,
+            },
+            "data": {"name": "data", "data_type": "text", "nullable": True},
+        },
+        "write_disposition": "append",
+    }
+    schema._schema_tables["test_table"] = table_schema  # type: ignore[assignment]
+
+    dest = risingwave()
+    capabilities = dest.capabilities()
+    client = RisingwaveClient(schema, config, capabilities)
+
+    columns = list(schema.tables["test_table"]["columns"].values())
+    sql_statements = client._get_table_update_sql("test_table", columns, generate_alter=False)
+    sql = sql_statements[0]
+
+    # Should contain composite PRIMARY KEY
+    assert "PRIMARY KEY" in sql
+    assert "PRIMARY KEY (user_id, event_id)" in sql
+
+
+def test_risingwave_primary_key_with_all_clauses() -> None:
+    """Test that PRIMARY KEY works correctly with ENGINE, APPEND ONLY, and WITH clauses."""
+    config = RisingwaveClientConfiguration()
+    config.credentials = RisingwaveCredentials()
+    config.credentials.database = "test_db"
+    config.credentials.host = "localhost"
+    config.credentials.password = "password"
+    config.credentials.port = 4566
+    config.credentials.username = "root"
+    config.create_indexes = True
+    config.table_engine = "iceberg"
+    config.dataset_name = "test_dataset"
+
+    schema = Schema("test_schema")
+    # Create table schema directly with hints and primary_key
+    table_schema = {
+        "name": "test_table",
+        "columns": {
+            "id": {"name": "id", "data_type": "bigint", "nullable": False, "primary_key": True},
+            "event_type": {"name": "event_type", "data_type": "text", "nullable": True},
+            "created_at": {
+                "name": "created_at",
+                "data_type": "timestamp",
+                "nullable": True,
+            },
+        },
+        TABLE_ENGINE_HINT: "iceberg",
+        TABLE_APPEND_ONLY_HINT: True,
+        TABLE_PROPERTIES_HINT: {"timeline.timestamp_column": "created_at"},
+        "write_disposition": "append",
+    }
+    schema._schema_tables["test_table"] = table_schema  # type: ignore[assignment]
+
+    dest = risingwave()
+    capabilities = dest.capabilities()
+    client = RisingwaveClient(schema, config, capabilities)
+
+    columns = list(schema.tables["test_table"]["columns"].values())
+    sql_statements = client._get_table_update_sql("test_table", columns, generate_alter=False)
+    sql = sql_statements[0]
+
+    # Check that all clauses are present in the correct order
+    assert "PRIMARY KEY (id)" in sql
+    assert "APPEND ONLY" in sql
+    assert "WITH (timeline.timestamp_column" in sql  # Accept both quoted and unquoted
+    assert "ENGINE = iceberg" in sql
+
+    # Check clause order: PRIMARY KEY comes before APPEND ONLY
+    pk_pos = sql.find("PRIMARY KEY")
+    append_pos = sql.find("APPEND ONLY")
+    with_pos = sql.find("WITH (")
+    engine_pos = sql.find("ENGINE = iceberg")
+
+    assert pk_pos < append_pos, "PRIMARY KEY should come before APPEND ONLY"
+    assert append_pos < with_pos, "APPEND ONLY should come before WITH"
+    assert with_pos < engine_pos, "WITH should come before ENGINE"
+
+
+def test_risingwave_primary_key_no_primary_key_hint(
+    risingwave_client_config: RisingwaveClientConfiguration,
+) -> None:
+    """Test that no PRIMARY KEY is created when no columns have primary_key hint."""
+    risingwave_client_config.create_indexes = True
+
+    schema = Schema("test_schema")
+    # Create table schema without primary_key hints
+    table_schema = {
+        "name": "test_table",
+        "columns": {
+            "id": {"name": "id", "data_type": "bigint", "nullable": False},
+            "name": {"name": "name", "data_type": "text", "nullable": True},
+        },
+        "write_disposition": "append",
+    }
+    schema._schema_tables["test_table"] = table_schema  # type: ignore[assignment]
+
+    dest = risingwave()
+    capabilities = dest.capabilities()
+    client = RisingwaveClient(schema, risingwave_client_config, capabilities)
+
+    columns = list(schema.tables["test_table"]["columns"].values())
+    sql_statements = client._get_table_update_sql("test_table", columns, generate_alter=False)
+    sql = sql_statements[0]
+
+    # Should NOT contain PRIMARY KEY when no columns have primary_key hint
+    assert "PRIMARY KEY" not in sql
+
+
+# ==================== Tests for RisingwaveLoadJob (file_scan SQL generation) ====================
+
+
+@pytest.fixture
+def mock_staging_config_aws() -> AwsCredentialsWithoutDefaults:
+    """Mock AWS S3 staging credentials."""
+    creds = AwsCredentialsWithoutDefaults()
+    creds.aws_access_key_id = "test_access_key"
+    creds.aws_secret_access_key = "test_secret_key"
+    creds.region_name = "us-east-1"
+    return creds
+
+
+@pytest.fixture
+def mock_staging_config_gcp_service_account() -> GcpServiceAccountCredentialsWithoutDefaults:
+    """Mock GCP GCS staging credentials with service account."""
+    creds = GcpServiceAccountCredentialsWithoutDefaults()
+    creds.project_id = "test-project"
+    creds.private_key = "-----BEGIN PRIVATE KEY-----\ntest_key\n-----END PRIVATE KEY-----"
+    creds.private_key_id = "key_id"
+    creds.client_email = "test@test-project.iam.gserviceaccount.com"
+    return creds
+
+
+@pytest.fixture
+def mock_staging_config_gcp_oauth() -> GcpOAuthCredentialsWithoutDefaults:
+    """Mock GCP GCS staging credentials with OAuth token."""
+    creds = GcpOAuthCredentialsWithoutDefaults()
+    creds.project_id = "test-project"
+    creds.token = "ya29.test_oauth_token"
+    return creds
+
+
+@pytest.fixture
+def mock_staging_config_azure() -> AzureCredentialsWithoutDefaults:
+    """Mock Azure Blob storage credentials."""
+    creds = AzureCredentialsWithoutDefaults()
+    creds.azure_storage_account_name = "testaccount"
+    creds.azure_storage_account_key = "test_key"
+    creds.azure_account_host = "https://testaccount.blob.core.windows.net"
+    return creds
+
+
+def _create_mock_job(creds: Any) -> RisingwaveLoadJob:
+    """Helper to create a mock RisingwaveLoadJob for testing _build_table_function."""
+    # Use a valid file path format that ParsedLoadJobFileName can parse
+    # Format: table_name.file_id.retry_count.file_format (4 parts)
+    file_path = "test_client/my_table.0.0.parquet"
+
+    config = PostgresClientConfiguration()
+    config.credentials = RisingwaveCredentials()
+    config.credentials.database = "test_db"
+    config.credentials.host = "localhost"
+    config.credentials.port = 4566
+    config.credentials.username = "root"
+    config.dataset_name = "test_dataset"
+
+    return RisingwaveLoadJob(file_path, config, creds)
+
+
+def test_risingwave_load_job_file_scan_s3(
+    mock_staging_config_aws: AwsCredentialsWithoutDefaults,
+) -> None:
+    """Test file_scan() SQL generation for S3."""
+    from urllib.parse import urlparse
+
+    job = _create_mock_job(mock_staging_config_aws)
+
+    bucket_url = urlparse("s3://test-bucket/data/file.parquet")
+    file_name = "file.parquet"
+    table_function = job._build_table_function(bucket_url, file_name, "parquet")
+
+    # Should contain S3 file_scan syntax
+    assert "file_scan(" in table_function
+    assert "'parquet'" in table_function
+    assert "'s3'" in table_function
+    assert "'us-east-1'" in table_function
+    assert "'test_access_key'" in table_function
+    assert "'test_secret_key'" in table_function
+    assert "'s3://test-bucket/data/file.parquet'" in table_function
+
+
+def test_risingwave_load_job_file_scan_s3_missing_region(
+    mock_staging_config_aws: AwsCredentialsWithoutDefaults,
+) -> None:
+    """Test that S3 without region_name raises an error."""
+    from urllib.parse import urlparse
+
+    mock_staging_config_aws.region_name = None
+
+    job = _create_mock_job(mock_staging_config_aws)
+
+    bucket_url = urlparse("s3://bucket/file.parquet")
+
+    with pytest.raises(Exception) as exc_info:
+        job._build_table_function(bucket_url, "file.parquet", "parquet")
+
+    assert "region_name" in str(exc_info.value)
+
+
+def test_risingwave_load_job_file_scan_gcs_service_account(
+    mock_staging_config_gcp_service_account: GcpServiceAccountCredentialsWithoutDefaults,
+) -> None:
+    """Test file_scan() SQL generation for GCS with service account."""
+    from urllib.parse import urlparse
+
+    job = _create_mock_job(mock_staging_config_gcp_service_account)
+
+    bucket_url = urlparse("gs://test-bucket/data/file.parquet")
+    file_name = "file.parquet"
+    table_function = job._build_table_function(bucket_url, file_name, "parquet")
+
+    # Should contain GCS file_scan syntax with service account
+    assert "file_scan(" in table_function
+    assert "'parquet'" in table_function
+    assert "'gcs'" in table_function
+    assert "'gs://test-bucket/data/file.parquet'" in table_function
+    # Service account JSON should be in the function (via to_native_representation)
+    assert "test-project" in table_function or "service_account" in table_function
+
+
+def test_risingwave_load_job_file_scan_gcs_oauth(
+    mock_staging_config_gcp_oauth: GcpOAuthCredentialsWithoutDefaults,
+) -> None:
+    """Test file_scan() SQL generation for GCS with OAuth token."""
+    from urllib.parse import urlparse
+
+    job = _create_mock_job(mock_staging_config_gcp_oauth)
+
+    bucket_url = urlparse("gs://test-bucket/data/file.parquet")
+    file_name = "file.parquet"
+    table_function = job._build_table_function(bucket_url, file_name, "parquet")
+
+    # Should contain GCS file_scan syntax with OAuth token
+    assert "file_scan(" in table_function
+    assert "'parquet'" in table_function
+    assert "'gcs'" in table_function
+    assert "'ya29.test_oauth_token'" in table_function
+    assert "'gs://test-bucket/data/file.parquet'" in table_function
+
+
+def test_risingwave_load_job_file_scan_azure(
+    mock_staging_config_azure: AzureCredentialsWithoutDefaults,
+) -> None:
+    """Test file_scan() SQL generation for Azure Blob Storage."""
+    from urllib.parse import urlparse
+
+    job = _create_mock_job(mock_staging_config_azure)
+
+    bucket_url = urlparse("az://test-container/data/file.parquet")
+    file_name = "file.parquet"
+    table_function = job._build_table_function(bucket_url, file_name, "parquet")
+
+    # Should contain Azure Blob file_scan syntax
+    assert "file_scan(" in table_function
+    assert "'parquet'" in table_function
+    assert "'azblob'" in table_function
+    assert "'testaccount'" in table_function
+    assert "'test_key'" in table_function
+    assert "'https://testaccount.blob.core.windows.net'" in table_function
+    assert "'az://test-container/data/file.parquet'" in table_function
+
+
+def test_risingwave_load_job_file_scan_azure_missing_credentials() -> None:
+    """Test that Azure without required credentials raises an error."""
+    from urllib.parse import urlparse
+
+    creds = AzureCredentialsWithoutDefaults()
+    creds.azure_storage_account_name = "testaccount"
+    # Missing azure_storage_account_key and azure_account_host
+
+    job = _create_mock_job(creds)
+
+    bucket_url = urlparse("az://container/file.parquet")
+
+    with pytest.raises(Exception) as exc_info:
+        job._build_table_function(bucket_url, "file.parquet", "parquet")
+
+    assert (
+        "azure_storage_account_name" in str(exc_info.value)
+        or "azure_storage_account_key" in str(exc_info.value)
+        or "azure_account_host" in str(exc_info.value)
+    )
+
+
+def test_risingwave_load_job_unsupported_scheme() -> None:
+    """Test that unsupported filesystem schemes raise an error."""
+    from urllib.parse import urlparse
+
+    creds = AwsCredentialsWithoutDefaults()
+    creds.aws_access_key_id = "test_key"
+    creds.aws_secret_access_key = "test_secret"
+    creds.region_name = "us-east-1"
+
+    job = _create_mock_job(creds)
+
+    # Using an unsupported scheme (e.g., wasb:// with AWS credentials)
+    bucket_url = urlparse("wasb://container/file.parquet")
+
+    with pytest.raises(Exception) as exc_info:
+        job._build_table_function(bucket_url, "file.parquet", "parquet")
+
+    assert "does not support" in str(exc_info.value)
+    assert "wasb" in str(exc_info.value)
+
+
+def test_risingwave_load_job_supported_file_formats() -> None:
+    """Test that only parquet format is supported for staging."""
+    assert RisingwaveLoadJob.SUPPORTED_FILE_FORMATS == ["parquet"]
+    assert RisingwaveLoadJob.FILE_FORMAT_TO_RISINGWAVE_FORMAT_MAPPING == {"parquet": "parquet"}
+
+
+# ==================== Tests for truncate_tables and file_format_selector ====================
+
+
+def test_risingwave_sql_client_truncate_tables() -> None:
+    """Test that truncate_tables uses DELETE FROM instead of TRUNCATE TABLE."""
+    credentials = RisingwaveCredentials()
+    credentials.database = "test_db"
+    credentials.host = "localhost"
+    credentials.port = 4566
+    credentials.username = "root"
+
+    # Create proper capabilities mock
+    capabilities = risingwave().capabilities()
+
+    client = RisingwaveSqlClient(
+        dataset_name="test_dataset",
+        staging_dataset_name="test_staging_dataset",
+        credentials=credentials,
+        capabilities=capabilities,
+    )
+
+    # Mock execute_many to capture the SQL statements
+    statements_executed: list[list[object]] = []
+
+    def mock_execute_many(statements: Sequence[object]) -> Sequence[object]:
+        statements_executed.append(list(statements))
+        return []
+
+    with patch.object(client, "execute_many", mock_execute_many):
+        # Test truncating multiple tables
+        client.truncate_tables("table1", "table2", "table3")
+
+    # Should generate DELETE FROM statements (not TRUNCATE TABLE)
+    assert len(statements_executed) == 1
+    assert all("DELETE FROM" in str(stmt) for stmt in statements_executed[0])
+    assert all("TRUNCATE" not in str(stmt) for stmt in statements_executed[0])
+
+    # Check that table names are properly qualified
+    assert any("table1" in str(stmt) for stmt in statements_executed[0])
+    assert any("table2" in str(stmt) for stmt in statements_executed[0])
+    assert any("table3" in str(stmt) for stmt in statements_executed[0])
+
+
+def test_risingwave_sql_client_truncate_tables_empty() -> None:
+    """Test that truncate_tables with no tables does nothing."""
+    credentials = RisingwaveCredentials()
+    credentials.database = "test_db"
+    credentials.host = "localhost"
+    credentials.port = 4566
+    credentials.username = "root"
+
+    # Create proper capabilities mock
+    capabilities = risingwave().capabilities()
+
+    client = RisingwaveSqlClient(
+        dataset_name="test_dataset",
+        staging_dataset_name="test_staging_dataset",
+        credentials=credentials,
+        capabilities=capabilities,
+    )
+
+    # Mock execute_many to verify it's not called
+    execute_called: list[list[object]] = []
+
+    def mock_execute_many(statements: Sequence[object]) -> Sequence[object]:
+        execute_called.append(list(statements))
+        return []
+
+    with patch.object(client, "execute_many", mock_execute_many):
+        # Test truncating no tables
+        client.truncate_tables()
+
+    # Should not call execute_many
+    assert len(execute_called) == 0
+
+
+def test_risingwave_file_format_selector_parquet_added() -> None:
+    """Test that parquet is always added to supported formats."""
+    supported_formats: list[TLoaderFileFormat] = ["insert_values", "csv"]
+    table_schema: TTableSchema = {
+        "name": "test_table",
+        "columns": {},
+    }
+
+    preferred, supported = _risingwave_file_format_selector(
+        "insert_values", supported_formats, table_schema=table_schema
+    )
+
+    # Parquet should be added
+    assert "parquet" in supported
+    assert preferred == "insert_values"  # Preferred format stays the same
+
+
+def test_risingwave_file_format_selector_parquet_already_present() -> None:
+    """Test that parquet is not duplicated if already present."""
+    supported_formats: list[TLoaderFileFormat] = ["insert_values", "csv", "parquet"]
+    table_schema: TTableSchema = {
+        "name": "test_table",
+        "columns": {},
+    }
+
+    preferred, supported = _risingwave_file_format_selector(
+        "insert_values", supported_formats, table_schema=table_schema
+    )
+
+    # Parquet should be present (not duplicated)
+    assert supported.count("parquet") == 1
+    assert preferred == "insert_values"
+
+
+def test_risingwave_file_format_selector_preserves_preferred() -> None:
+    """Test that the preferred file format is preserved."""
+    supported_formats: list[TLoaderFileFormat] = ["insert_values", "csv"]
+    table_schema: TTableSchema = {
+        "name": "test_table",
+        "columns": {},
+    }
+
+    # Test with different preferred formats
+    for preferred_fmt in ["insert_values", "csv", "parquet"]:
+        preferred_fmt_typed: TLoaderFileFormat = cast(TLoaderFileFormat, preferred_fmt)
+        preferred, supported = _risingwave_file_format_selector(
+            preferred_fmt_typed, supported_formats, table_schema=table_schema
+        )
+        assert preferred == preferred_fmt
+        assert "parquet" in supported
+
+
+def test_risingwave_capabilities_merge_replace_strategies() -> None:
+    """Test that Risingwave declares correct merge and replace strategies."""
+    dest = risingwave()
+    capabilities = dest.capabilities()
+
+    # Validate merge strategies
+    # - scd2 IS supported (implemented by dlt at application layer using UPDATE/INSERT)
+    # - upsert IS supported (via ON CONFLICT clause)
+    # - delete-insert IS supported (as separate operations)
+    assert capabilities.supported_merge_strategies == ["delete-insert", "upsert", "scd2"]
+
+    # Validate replace strategies
+    # - truncate-and-insert IS supported (uses DELETE FROM instead of TRUNCATE TABLE)
+    # - insert-from-staging IS supported (uses file_scan())
+    # - staging-optimized IS supported (uses DELETE FROM for staging tables)
+    assert capabilities.supported_replace_strategies == [
+        "truncate-and-insert",
+        "insert-from-staging",
+        "staging-optimized",
+    ]
+
+
+def test_risingwave_merge_job_delete_without_alias() -> None:
+    """Test that RisingwaveMergeJob generates DELETE statements without table aliases.
+
+    Risingwave does not support:
+    1. Table aliases in DELETE FROM statements (e.g., "DELETE FROM table AS d WHERE ...")
+    2. Fully qualified table names in correlated subquery WHERE clauses (e.g., "schema"."table"."column")
+
+    The merge job should:
+    1. Generate DELETE without 'AS d' alias
+    2. Use just the base table name (not schema-qualified) for outer table references in WHERE clause
+    """
+    from dlt.destinations.impl.risingwave.risingwave import RisingwaveMergeJob
+
+    # Test DELETE clause generation (for_delete=True) with quoted qualified names
+    root_table = '"public"."users"'
+    staging_table = '"public_staging"."users"'
+    key_clauses = ['"user_id" = {d}."user_id"']
+
+    delete_clauses = RisingwaveMergeJob.gen_key_table_clauses(
+        root_table, staging_table, key_clauses, for_delete=True
+    )
+
+    # Should NOT contain table alias (AS d)
+    assert len(delete_clauses) == 1
+    clause = delete_clauses[0]
+    assert " AS d" not in clause
+    assert " as d" not in clause
+    assert "AS d" not in clause
+    # Should use full qualified table name in DELETE FROM
+    assert '"public"."users"' in clause
+    # Should use just base table name (users) for outer table reference in WHERE
+    assert 'users."user_id"' in clause
+    # Should NOT use fully qualified name for outer table reference in WHERE
+    assert '"public"."users"."user_id"' not in clause
+
+    # Test with unquoted qualified names
+    root_table2 = 'public.users'
+    staging_table2 = 'public_staging.users'
+    delete_clauses2 = RisingwaveMergeJob.gen_key_table_clauses(
+        root_table2, staging_table2, key_clauses, for_delete=True
+    )
+    clause2 = delete_clauses2[0]
+    # Should use just base table name (users) for outer table reference in WHERE
+    assert 'users."user_id"' in clause2
+    # Should NOT use fully qualified name for outer table reference in WHERE
+    assert 'public.users."user_id"' not in clause2
+
+    # Test SELECT clause generation (for_delete=False) - should use aliases
+    select_clauses = RisingwaveMergeJob.gen_key_table_clauses(
+        root_table, staging_table, key_clauses, for_delete=False
+    )
+
+    # Should contain table aliases for SELECT
+    assert len(select_clauses) == 1
+    select_clause = select_clauses[0]
+    assert "AS d" in select_clause or "as d" in select_clause
+
+
+def test_risingwave_merge_job_default_order_by() -> None:
+    """Test that RisingwaveMergeJob default_order_by returns NULL not a subquery.
+
+    Risingwave does not support subqueries inside ORDER BY clauses.
+    The default_order_by should return 'NULL' instead of '(SELECT NULL)'.
+    """
+    from dlt.destinations.impl.risingwave.risingwave import RisingwaveMergeJob
+
+    # Test default_order_by returns NULL (not a subquery)
+    order_by = RisingwaveMergeJob.default_order_by()
+
+    assert order_by == "NULL"
+    # Should NOT be a subquery
+    assert order_by != "(SELECT NULL)"
+    assert "SELECT" not in order_by

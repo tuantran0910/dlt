@@ -18,6 +18,7 @@ from dlt.destinations.impl.synapse.factory import synapse
 from dlt.destinations.impl.databricks.factory import databricks
 from dlt.destinations.impl.dremio.factory import dremio
 from dlt.destinations.impl.clickhouse.factory import clickhouse
+from dlt.destinations.impl.risingwave.factory import risingwave
 from dlt.destinations.impl.sqlalchemy.factory import sqlalchemy
 
 
@@ -41,6 +42,7 @@ __all__ = [
     "databricks",
     "dremio",
     "clickhouse",
+    "risingwave",
     "destination",
     "sqlalchemy",
 ]
