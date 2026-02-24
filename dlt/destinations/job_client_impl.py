@@ -305,20 +305,24 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
     ) -> Optional[TSchemaTables]:
         super().update_stored_schema(only_tables, expected_update)
         applied_update: TSchemaTables = {}
+
+        # Always execute schema update SQL, even when schema exists
+        # _build_schema_update_sql will only generate SQL for tables that need to be
+        # created or altered, so existing tables are not affected
         schema_info = self.get_stored_schema_by_hash(self.schema.stored_version_hash)
         if schema_info is None:
             logger.info(
                 f"Schema with hash {self.schema.stored_version_hash} not found in the storage."
                 " upgrading"
             )
-
-            with self.maybe_ddl_transaction():
-                applied_update = self._execute_schema_update_sql(only_tables)
         else:
             logger.info(
                 f"Schema with hash {self.schema.stored_version_hash} inserted at"
-                f" {schema_info.inserted_at} found in storage, no upgrade required"
+                f" {schema_info.inserted_at} found in storage"
             )
+
+        with self.maybe_ddl_transaction():
+            applied_update = self._execute_schema_update_sql(only_tables)
         return applied_update
 
     def drop_tables(self, *tables: str, delete_schema: bool = True) -> None:

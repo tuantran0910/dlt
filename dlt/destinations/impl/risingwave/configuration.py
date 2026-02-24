@@ -11,7 +11,9 @@ from dlt.destinations.impl.postgres.configuration import (
 
 @configspec(init=False)
 class RisingwaveCredentials(PostgresCredentials):
-    drivername: Final[str] = dataclasses.field(default="postgresql", init=False, repr=False, compare=False)  # type: ignore
+    drivername: Final[str] = dataclasses.field(  # type: ignore
+        default="postgresql", init=False, repr=False, compare=False
+    )
     port: int = 4566
 
     __config_gen_annotations__: ClassVar[List[str]] = ["port"]
@@ -19,7 +21,9 @@ class RisingwaveCredentials(PostgresCredentials):
 
 @configspec
 class RisingwaveClientConfiguration(PostgresClientConfiguration):
-    destination_type: Final[str] = dataclasses.field(default="risingwave", init=False, repr=False, compare=False)  # type: ignore
+    destination_type: Final[str] = dataclasses.field(  # type: ignore
+        default="risingwave", init=False, repr=False, compare=False
+    )
     credentials: RisingwaveCredentials = None
 
     table_engine: Optional[str] = None
@@ -28,6 +32,10 @@ class RisingwaveClientConfiguration(PostgresClientConfiguration):
 
     create_indexes: bool = False
     """Whether PRIMARY KEY constraints should be created. Defaults to False."""
+
+    staging_table_name_suffix: Optional[str] = None
+    """Optional suffix to append to table names in staging dataset (e.g., '_staging').
+       Internal dlt tables (_dlt_*) will NOT be suffixed."""
 
     def fingerprint(self) -> str:
         """Returns a fingerprint of host part of a connection string"""

@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING, cast, Uni
 from urllib.parse import ParseResult, urlparse
 
 from dlt.common import logger
+from dlt.common.schema.utils import get_columns_names_with_prop
 from dlt.common.configuration.specs import (
     AwsCredentialsWithoutDefaults,
     GcpCredentials,
@@ -10,6 +11,7 @@ from dlt.common.configuration.specs import (
 )
 from dlt.common.destination import DestinationCapabilitiesContext
 from dlt.common.destination.client import (
+    FollowupJobRequest,
     HasFollowupJobs,
     PreparedTableSchema,
     RunnableLoadJob,
@@ -18,10 +20,11 @@ from dlt.common.destination.client import (
 )
 from dlt.common.schema import Schema, TColumnSchema
 from dlt.common.schema.typing import TColumnType
-from dlt.common.schema.utils import get_columns_names_with_prop
+from dlt.common.schema.utils import get_columns_names_with_prop, is_nested_table
 from dlt.common.storages import FileStorage
 from dlt.destinations.exceptions import LoadJobTerminalException
 from dlt.destinations.impl.postgres.configuration import PostgresClientConfiguration
+from dlt.destinations.impl.risingwave.configuration import RisingwaveClientConfiguration
 from dlt.destinations.impl.risingwave.risingwave_sql_client import RisingwaveSqlClient
 from dlt.destinations.impl.risingwave.typing import (
     TABLE_APPEND_ONLY_HINT,
@@ -33,6 +36,7 @@ from dlt.destinations.insert_job_client import InsertValuesJobClient
 from dlt.destinations.job_client_impl import SqlJobClientWithStagingDataset
 from dlt.destinations.job_impl import ReferenceFollowupJobRequest
 from dlt.destinations.path_utils import get_file_format_and_compression
+from dlt.destinations.sql_client import SqlClientBase
 from dlt.destinations.sql_jobs import SqlMergeFollowupJob
 from dlt.common.configuration.specs import (
     GcpCredentials,
@@ -68,7 +72,7 @@ class RisingwaveLoadJob(RunnableLoadJob, HasFollowupJobs):
     def __init__(
         self,
         file_path: str,
-        config: PostgresClientConfiguration,
+        config: RisingwaveClientConfiguration,
         staging_credentials: TStagingCredentials,
     ) -> None:
         super().__init__(file_path)
@@ -262,10 +266,10 @@ class RisingwaveMergeJob(SqlMergeFollowupJob):
             parts = root_table_name.split('"')
             if len(parts) > 1:
                 # Format: "schema"."table" - extract the table name (last quoted part)
-                base_table_name = parts[-2] if parts[-1] == '' else parts[-1]
+                base_table_name = parts[-2] if parts[-1] == "" else parts[-1]
             else:
                 # Format: schema.table or table - extract last part
-                base_table_name = root_table_name.split('.')[-1]
+                base_table_name = root_table_name.split(".")[-1]
 
             return [
                 f"FROM {root_table_name} WHERE EXISTS (SELECT 1 FROM"
@@ -296,7 +300,7 @@ class RisingwaveClient(InsertValuesJobClient, SupportsStagingDestination):
     def __init__(
         self,
         schema: Schema,
-        config: PostgresClientConfiguration,
+        config: RisingwaveClientConfiguration,
         capabilities: DestinationCapabilitiesContext,
     ) -> None:
         dataset_name, staging_dataset_name = SqlJobClientWithStagingDataset.create_dataset_names(
@@ -307,9 +311,11 @@ class RisingwaveClient(InsertValuesJobClient, SupportsStagingDestination):
             staging_dataset_name,
             config.credentials,
             capabilities,
+            staging_table_name_suffix=config.staging_table_name_suffix,
+            dlt_tables_prefix=schema._dlt_tables_prefix,
         )
         super().__init__(schema, config, sql_client)
-        self.config: PostgresClientConfiguration = config
+        self.config: RisingwaveClientConfiguration = config
         self.sql_client: RisingwaveSqlClient = sql_client
         self.type_mapper = self.capabilities.get_type_mapper()
 
@@ -435,7 +441,7 @@ class RisingwaveClient(InsertValuesJobClient, SupportsStagingDestination):
 
     def _create_merge_followup_jobs(
         self, table_chain: Sequence[PreparedTableSchema]
-    ) -> List["ReferenceFollowupJobRequest"]:
+    ) -> List["FollowupJobRequest"]:
         """Create merge followup jobs using RisingwaveMergeJob.
 
         Risingwave does not support table aliases in DELETE FROM statements,

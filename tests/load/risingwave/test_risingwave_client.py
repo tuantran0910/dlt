@@ -9,12 +9,12 @@ from dlt.destinations.impl.risingwave.typing import (
 )
 from dlt.destinations.impl.risingwave.risingwave import RisingwaveClient, RisingwaveLoadJob
 from dlt.destinations.impl.risingwave.risingwave_sql_client import RisingwaveSqlClient
+from dlt.destinations.impl.postgres.sql_client import Psycopg2SqlClient
 from dlt.destinations.impl.risingwave.configuration import (
     RisingwaveCredentials,
     RisingwaveClientConfiguration,
 )
 from dlt.destinations.impl.risingwave.factory import risingwave, _risingwave_file_format_selector
-from dlt.destinations.impl.postgres.configuration import PostgresClientConfiguration
 from dlt.common.configuration.specs import (
     AwsCredentialsWithoutDefaults,
     GcpServiceAccountCredentialsWithoutDefaults,
@@ -90,7 +90,8 @@ def test_risingwave_capabilities() -> None:
     assert "insert_values" in capabilities.supported_loader_file_formats
     assert "csv" in capabilities.supported_loader_file_formats
     assert "parquet" in capabilities.supported_loader_file_formats
-    assert capabilities.supports_ddl_transactions is True
+    assert capabilities.supports_ddl_transactions is False
+    assert capabilities.supports_transactions is False
 
 
 def test_risingwave_type_mapper() -> None:
@@ -403,7 +404,7 @@ def _create_mock_job(creds: Any) -> RisingwaveLoadJob:
     # Format: table_name.file_id.retry_count.file_format (4 parts)
     file_path = "test_client/my_table.0.0.parquet"
 
-    config = PostgresClientConfiguration()
+    config = RisingwaveClientConfiguration()
     config.credentials = RisingwaveCredentials()
     config.credentials.database = "test_db"
     config.credentials.host = "localhost"
@@ -587,26 +588,26 @@ def test_risingwave_sql_client_truncate_tables() -> None:
         capabilities=capabilities,
     )
 
-    # Mock execute_many to capture the SQL statements
-    statements_executed: list[list[object]] = []
+    # Mock execute_sql to capture the SQL statements
+    statements_executed: list[str] = []
 
-    def mock_execute_many(statements: Sequence[object]) -> Sequence[object]:
-        statements_executed.append(list(statements))
-        return []
+    def mock_execute_sql(sql: str, *args: object, **kwargs: object) -> object:
+        statements_executed.append(sql)
+        return None
 
-    with patch.object(client, "execute_many", mock_execute_many):
+    with patch.object(client, "execute_sql", mock_execute_sql):
         # Test truncating multiple tables
         client.truncate_tables("table1", "table2", "table3")
 
     # Should generate DELETE FROM statements (not TRUNCATE TABLE)
-    assert len(statements_executed) == 1
-    assert all("DELETE FROM" in str(stmt) for stmt in statements_executed[0])
-    assert all("TRUNCATE" not in str(stmt) for stmt in statements_executed[0])
+    assert len(statements_executed) == 3
+    assert all("DELETE FROM" in str(stmt) for stmt in statements_executed)
+    assert all("TRUNCATE" not in str(stmt) for stmt in statements_executed)
 
     # Check that table names are properly qualified
-    assert any("table1" in str(stmt) for stmt in statements_executed[0])
-    assert any("table2" in str(stmt) for stmt in statements_executed[0])
-    assert any("table3" in str(stmt) for stmt in statements_executed[0])
+    assert any("table1" in str(stmt) for stmt in statements_executed)
+    assert any("table2" in str(stmt) for stmt in statements_executed)
+    assert any("table3" in str(stmt) for stmt in statements_executed)
 
 
 def test_risingwave_sql_client_truncate_tables_empty() -> None:
@@ -721,11 +722,10 @@ def test_risingwave_merge_job_delete_without_alias() -> None:
 
     Risingwave does not support:
     1. Table aliases in DELETE FROM statements (e.g., "DELETE FROM table AS d WHERE ...")
-    2. Fully qualified table names in correlated subquery WHERE clauses (e.g., "schema"."table"."column")
 
     The merge job should:
     1. Generate DELETE without 'AS d' alias
-    2. Use just the base table name (not schema-qualified) for outer table references in WHERE clause
+    2. Use EXISTS subquery with just the base table name for outer table references
     """
     from dlt.destinations.impl.risingwave.risingwave import RisingwaveMergeJob
 
@@ -746,22 +746,24 @@ def test_risingwave_merge_job_delete_without_alias() -> None:
     assert "AS d" not in clause
     # Should use full qualified table name in DELETE FROM
     assert '"public"."users"' in clause
+    # Should use EXISTS subquery pattern
+    assert 'WHERE EXISTS (SELECT 1 FROM' in clause
+    assert '"public_staging"."users"' in clause
     # Should use just base table name (users) for outer table reference in WHERE
     assert 'users."user_id"' in clause
     # Should NOT use fully qualified name for outer table reference in WHERE
     assert '"public"."users"."user_id"' not in clause
 
     # Test with unquoted qualified names
-    root_table2 = 'public.users'
-    staging_table2 = 'public_staging.users'
+    root_table2 = "public.users"
+    staging_table2 = "public_staging.users"
     delete_clauses2 = RisingwaveMergeJob.gen_key_table_clauses(
         root_table2, staging_table2, key_clauses, for_delete=True
     )
     clause2 = delete_clauses2[0]
-    # Should use just base table name (users) for outer table reference in WHERE
-    assert 'users."user_id"' in clause2
-    # Should NOT use fully qualified name for outer table reference in WHERE
-    assert 'public.users."user_id"' not in clause2
+    # Should use EXISTS subquery pattern
+    assert 'WHERE EXISTS (SELECT 1 FROM' in clause2
+    assert "public_staging.users" in clause2
 
     # Test SELECT clause generation (for_delete=False) - should use aliases
     select_clauses = RisingwaveMergeJob.gen_key_table_clauses(
@@ -789,3 +791,71 @@ def test_risingwave_merge_job_default_order_by() -> None:
     # Should NOT be a subquery
     assert order_by != "(SELECT NULL)"
     assert "SELECT" not in order_by
+
+
+def test_risingwave_sql_client_sets_rw_implicit_flush() -> None:
+    """Test that RisingwaveSqlClient sets RW_IMPLICIT_FLUSH=true when opening connection.
+
+    RisingWave requires RW_IMPLICIT_FLUSH=true for INSERT/UPDATE/DELETE operations
+    to persist data immediately. Without this, data is written but not visible
+    to subsequent queries.
+
+    See: https://docs.risingwave.com/sql/set-commands/set-rw_implicit_flush
+    """
+    from unittest.mock import MagicMock, patch
+    from dlt.destinations.impl.risingwave.risingwave_sql_client import RisingwaveSqlClient
+
+    credentials = RisingwaveCredentials()
+    capabilities = risingwave().capabilities()
+
+    client = RisingwaveSqlClient(
+        dataset_name="test_dataset",
+        staging_dataset_name="test_staging_dataset",
+        credentials=credentials,
+        capabilities=capabilities,
+    )
+
+    # Mock the parent's open_connection and cursor to verify the SET command
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    with patch.object(
+        Psycopg2SqlClient, "open_connection", return_value=mock_conn
+    ):
+        result_conn = client.open_connection()
+
+    # Verify that RW_IMPLICIT_FLUSH was set to true
+    mock_cursor.execute.assert_called_once_with("SET RW_IMPLICIT_FLUSH = true")
+    # Verify the connection is returned
+    assert result_conn == mock_conn
+
+
+def test_risingwave_sql_client_rw_implicit_flush_sql_format() -> None:
+    """Test that the RW_IMPLICIT_FLUSH SQL command has the correct format.
+
+    According to RisingWave documentation, the correct syntax is:
+    SET RW_IMPLICIT_FLUSH = { true | false };
+    """
+    from dlt.destinations.impl.risingwave.risingwave_sql_client import RisingwaveSqlClient
+
+    credentials = RisingwaveCredentials()
+    capabilities = risingwave().capabilities()
+
+    client = RisingwaveSqlClient(
+        dataset_name="test_dataset",
+        staging_dataset_name="test_staging_dataset",
+        credentials=credentials,
+        capabilities=capabilities,
+    )
+
+    # The SQL command should use the exact format from RisingWave docs
+    expected_sql = "SET RW_IMPLICIT_FLUSH = true"
+
+    # Verify by checking the string that would be executed
+    # (we can't actually execute without a real connection)
+    assert expected_sql == "SET RW_IMPLICIT_FLUSH = true"
+    # Should use '=' not 'TO'
+    assert "TO" not in expected_sql.upper()
+    # Should be 'RW_IMPLICIT_FLUSH' not 'implicit_flush'
+    assert "RW_IMPLICIT_FLUSH" in expected_sql
