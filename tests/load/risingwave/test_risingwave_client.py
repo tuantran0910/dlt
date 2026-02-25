@@ -132,6 +132,29 @@ def test_risingwave_type_mapper() -> None:
     assert "timestamp with time zone" in timestamp_type.lower()
 
 
+def test_risingwave_type_mapper_json_with_parquet_file_format() -> None:
+    """Test that json type always maps to jsonb, even with parquet file_format.
+
+    RisingWave does not support the 'json' type (only 'jsonb').
+    PostgresTypeMapper returns 'json' for parquet file_format (ADBC workaround),
+    but RisingWave doesn't use ADBC and doesn't support 'json'.
+    """
+    dest = risingwave()
+    type_mapper = dest.capabilities().get_type_mapper()
+
+    # Without file_format - should be jsonb
+    assert type_mapper.to_destination_type({"name": "data", "data_type": "json"}, {}) == "jsonb"
+
+    # With file_format="parquet" - should STILL be jsonb (not json)
+    assert (
+        type_mapper.to_destination_type(
+            {"name": "data", "data_type": "json"},
+            {"name": "test", "file_format": "parquet", "columns": {}},
+        )
+        == "jsonb"
+    )
+
+
 def test_risingwave_client_init(
     risingwave_client_config: RisingwaveClientConfiguration,
 ) -> None:

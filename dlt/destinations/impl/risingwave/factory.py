@@ -80,8 +80,14 @@ class RisingwaveTypeMapper(PostgresTypeMapper):
         - varchar(n) - only varchar without length
         - numeric(p,s) - only numeric without precision/scale
         - timestamp(p) - only timestamp without precision specification
+        - json - only jsonb
         """
         sc_t = column["data_type"]
+
+        # RisingWave only supports jsonb, not json.
+        # Override parent's ADBC workaround that returns "json" for parquet file_format.
+        if sc_t == "json":
+            return "jsonb"
 
         # For decimal and wei, always return numeric without precision/scale
         # Risingwave does not support specifying precision and scale
