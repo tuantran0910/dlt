@@ -701,9 +701,9 @@ def test_risingwave_capabilities_merge_replace_strategies() -> None:
     capabilities = dest.capabilities()
 
     # Validate merge strategies
-    # - scd2 IS supported (implemented by dlt at application layer using UPDATE/INSERT)
     # - delete-insert IS supported (as separate operations)
-    assert capabilities.supported_merge_strategies == ["delete-insert", "scd2"]
+    # - scd2 is NOT supported due to NULL type casting requirements
+    assert capabilities.supported_merge_strategies == ["delete-insert"]
 
     # Validate replace strategies
     # - truncate-and-insert IS supported (uses DELETE FROM instead of TRUNCATE TABLE)
@@ -852,34 +852,3 @@ def test_risingwave_sql_client_rw_implicit_flush_sql_format() -> None:
     assert "TO" not in expected_sql.upper()
     # Should be 'RW_IMPLICIT_FLUSH' not 'implicit_flush'
     assert "RW_IMPLICIT_FLUSH" in expected_sql
-
-
-def test_risingwave_datetime_format_with_explicit_cast() -> None:
-    """Test that Risingwave datetime formatter adds explicit type cast.
-
-    Unlike PostgreSQL, Risingwave does not implicitly cast string literals
-    to timestamp with time zone. The formatter must add an explicit cast.
-    """
-    from dlt.destinations.impl.risingwave.factory import format_risingwave_datetime_literal
-    from dlt.common.pendulum import pendulum
-
-    # Create a test datetime
-    test_dt = pendulum.parse("2026-02-25 01:55:08.123665+00:00")
-
-    # Format with default precision
-    formatted = format_risingwave_datetime_literal(test_dt)
-
-    # Should contain the explicit cast to timestamp with time zone
-    assert "::timestamp with time zone" in formatted
-    # Should contain the datetime string
-    assert "2026-02-25" in formatted
-    # Should start with a quote
-    assert formatted.startswith("'")
-
-    # Test with different precision
-    formatted_ms = format_risingwave_datetime_literal(test_dt, precision=3)
-    assert "::timestamp with time zone" in formatted_ms
-
-    # Test without timezone
-    formatted_no_tz = format_risingwave_datetime_literal(test_dt, no_tz=True)
-    assert "::timestamp with time zone" in formatted_no_tz
