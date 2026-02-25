@@ -1,7 +1,11 @@
 from typing import Any, Dict, Optional, Type, Union, TYPE_CHECKING, Sequence
 
 from dlt.common.arithmetics import DEFAULT_NUMERIC_PRECISION, DEFAULT_NUMERIC_SCALE
-from dlt.common.data_writers.escape import escape_postgres_identifier, escape_postgres_literal
+from dlt.common.data_writers.escape import (
+    escape_postgres_identifier,
+    escape_postgres_literal,
+    format_datetime_literal,
+)
 from dlt.common.destination import Destination, DestinationCapabilitiesContext
 from dlt.common.destination.configuration import CsvFormatConfiguration
 from dlt.common.destination.typing import PreparedTableSchema
@@ -13,6 +17,14 @@ from dlt.destinations.impl.risingwave.configuration import (
     RisingwaveClientConfiguration,
     RisingwaveCredentials,
 )
+
+try:
+    from pendulum import DateTime
+except ImportError:
+    from datetime import datetime as DateTime  # type: ignore[no-redef]
+
+if TYPE_CHECKING:
+    from dlt.destinations.impl.risingwave.risingwave import RisingwaveClient
 
 
 def _risingwave_file_format_selector(
@@ -45,8 +57,25 @@ def _risingwave_file_format_selector(
     return (preferred_loader_file_format, supported_formats)
 
 
-if TYPE_CHECKING:
-    from dlt.destinations.impl.risingwave.risingwave import RisingwaveClient
+def format_risingwave_datetime_literal(v: DateTime, precision: int = 6, no_tz: bool = False) -> str:
+    """Returns Risingwave-compatible timestamp literal with explicit type cast.
+
+    Unlike PostgreSQL, Risingwave does not implicitly cast string literals to
+    timestamp with time zone. This function adds an explicit cast to ensure
+    the string literal is properly interpreted as a timestamp.
+
+    Args:
+        v: DateTime value to format
+        precision: Microsecond precision (0-6)
+        no_tz: If True, strip timezone info
+
+    Returns:
+        SQL string literal with explicit cast: 'literal'::timestamp with time zone
+    """
+    # Get the base formatted datetime string
+    literal = format_datetime_literal(v, precision, no_tz)
+    # Add explicit cast for timestamp with time zone
+    return f"{literal}::timestamp with time zone"
 
 
 class RisingwaveTypeMapper(PostgresTypeMapper):
@@ -148,13 +177,12 @@ class risingwave(Destination[RisingwaveClientConfiguration, "RisingwaveClient"])
         caps.is_max_text_data_type_length_in_bytes = True
         caps.supports_ddl_transactions = False
         caps.supports_transactions = False
-        caps.supported_merge_strategies = ["delete-insert", "upsert", "scd2"]
-        caps.supported_replace_strategies = [
-            "truncate-and-insert",
-            "insert-from-staging",
-            "staging-optimized",
-        ]
+        caps.supported_merge_strategies = ["delete-insert", "scd2"]
+        caps.supported_replace_strategies = ["truncate-and-insert"]
         caps.sqlglot_dialect = "postgres"
+        # Use custom datetime formatter that adds explicit type cast
+        # for timestamp literals (required for SCD2 strategy)
+        caps.format_datetime_literal = format_risingwave_datetime_literal
 
         return caps
 

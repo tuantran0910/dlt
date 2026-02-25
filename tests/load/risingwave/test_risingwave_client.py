@@ -702,18 +702,13 @@ def test_risingwave_capabilities_merge_replace_strategies() -> None:
 
     # Validate merge strategies
     # - scd2 IS supported (implemented by dlt at application layer using UPDATE/INSERT)
-    # - upsert IS supported (via ON CONFLICT clause)
     # - delete-insert IS supported (as separate operations)
-    assert capabilities.supported_merge_strategies == ["delete-insert", "upsert", "scd2"]
+    assert capabilities.supported_merge_strategies == ["delete-insert", "scd2"]
 
     # Validate replace strategies
     # - truncate-and-insert IS supported (uses DELETE FROM instead of TRUNCATE TABLE)
-    # - insert-from-staging IS supported (uses file_scan())
-    # - staging-optimized IS supported (uses DELETE FROM for staging tables)
     assert capabilities.supported_replace_strategies == [
         "truncate-and-insert",
-        "insert-from-staging",
-        "staging-optimized",
     ]
 
 
@@ -747,7 +742,7 @@ def test_risingwave_merge_job_delete_without_alias() -> None:
     # Should use full qualified table name in DELETE FROM
     assert '"public"."users"' in clause
     # Should use EXISTS subquery pattern
-    assert 'WHERE EXISTS (SELECT 1 FROM' in clause
+    assert "WHERE EXISTS (SELECT 1 FROM" in clause
     assert '"public_staging"."users"' in clause
     # Should use just base table name (users) for outer table reference in WHERE
     assert 'users."user_id"' in clause
@@ -762,7 +757,7 @@ def test_risingwave_merge_job_delete_without_alias() -> None:
     )
     clause2 = delete_clauses2[0]
     # Should use EXISTS subquery pattern
-    assert 'WHERE EXISTS (SELECT 1 FROM' in clause2
+    assert "WHERE EXISTS (SELECT 1 FROM" in clause2
     assert "public_staging.users" in clause2
 
     # Test SELECT clause generation (for_delete=False) - should use aliases
@@ -820,9 +815,7 @@ def test_risingwave_sql_client_sets_rw_implicit_flush() -> None:
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
 
-    with patch.object(
-        Psycopg2SqlClient, "open_connection", return_value=mock_conn
-    ):
+    with patch.object(Psycopg2SqlClient, "open_connection", return_value=mock_conn):
         result_conn = client.open_connection()
 
     # Verify that RW_IMPLICIT_FLUSH was set to true
@@ -859,3 +852,34 @@ def test_risingwave_sql_client_rw_implicit_flush_sql_format() -> None:
     assert "TO" not in expected_sql.upper()
     # Should be 'RW_IMPLICIT_FLUSH' not 'implicit_flush'
     assert "RW_IMPLICIT_FLUSH" in expected_sql
+
+
+def test_risingwave_datetime_format_with_explicit_cast() -> None:
+    """Test that Risingwave datetime formatter adds explicit type cast.
+
+    Unlike PostgreSQL, Risingwave does not implicitly cast string literals
+    to timestamp with time zone. The formatter must add an explicit cast.
+    """
+    from dlt.destinations.impl.risingwave.factory import format_risingwave_datetime_literal
+    from dlt.common.pendulum import pendulum
+
+    # Create a test datetime
+    test_dt = pendulum.parse("2026-02-25 01:55:08.123665+00:00")
+
+    # Format with default precision
+    formatted = format_risingwave_datetime_literal(test_dt)
+
+    # Should contain the explicit cast to timestamp with time zone
+    assert "::timestamp with time zone" in formatted
+    # Should contain the datetime string
+    assert "2026-02-25" in formatted
+    # Should start with a quote
+    assert formatted.startswith("'")
+
+    # Test with different precision
+    formatted_ms = format_risingwave_datetime_literal(test_dt, precision=3)
+    assert "::timestamp with time zone" in formatted_ms
+
+    # Test without timezone
+    formatted_no_tz = format_risingwave_datetime_literal(test_dt, no_tz=True)
+    assert "::timestamp with time zone" in formatted_no_tz
