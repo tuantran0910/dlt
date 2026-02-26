@@ -145,7 +145,7 @@ class RisingwaveLoadJob(RunnableLoadJob, HasFollowupJobs):
                 f"'{access_key_id}', '{secret_access_key}', '{s3_url}')"
             )
 
-        elif scheme == "gs" and isinstance(self._staging_credentials, GcpCredentials):
+        elif scheme in ("gs", "gcs") and isinstance(self._staging_credentials, GcpCredentials):
             # GCS: file_scan('parquet', 'gcs', credential, service_account, file_location)
             # Check for Application Default Credentials (ADC)
             uses_adc = (
@@ -165,7 +165,10 @@ class RisingwaveLoadJob(RunnableLoadJob, HasFollowupJobs):
                 except Exception:
                     service_account_json = None
 
-            gcs_url = f"{bucket_url.scheme}://{bucket_url.netloc}{bucket_url.path}"
+            # Always use 'gcs' scheme for Risingwave. If we use "gs" scheme, we will encounter bug in sub path of the bucket uri.
+            # The file_scan function incorrectly truncates the first character of GCS paths when using the gs:// scheme.
+            # This is because the code hardcodes a prefix length based on gcs:// (6 characters) while standard GCS URIs often use gs:// (5 characters).
+            gcs_url = f"gcs://{bucket_url.netloc}{bucket_url.path}"
             parts = [f"'{risingwave_format}'", "'gcs'"]
 
             # Use ADC (empty string), OAuth token, or service account key

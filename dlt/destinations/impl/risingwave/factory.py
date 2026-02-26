@@ -134,7 +134,7 @@ class risingwave(Destination[RisingwaveClientConfiguration, "RisingwaveClient"])
         # https://www.risingwave.com/docs/
         caps = DestinationCapabilitiesContext()
         caps.preferred_loader_file_format = "insert_values"
-        caps.supported_loader_file_formats = ["insert_values", "csv", "parquet", "model"]
+        caps.supported_loader_file_formats = ["insert_values", "model"]
         # Use custom file format selector that keeps parquet available for file_scan()
         caps.loader_file_format_selector = _risingwave_file_format_selector
         caps.preferred_staging_file_format = "parquet"

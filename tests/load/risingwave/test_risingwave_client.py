@@ -88,8 +88,9 @@ def test_risingwave_capabilities() -> None:
     assert capabilities is not None
     assert capabilities.sqlglot_dialect == "postgres"
     assert "insert_values" in capabilities.supported_loader_file_formats
-    assert "csv" in capabilities.supported_loader_file_formats
-    assert "parquet" in capabilities.supported_loader_file_formats
+    assert "csv" not in capabilities.supported_loader_file_formats
+    assert "parquet" not in capabilities.supported_loader_file_formats
+    assert "parquet" in capabilities.supported_staging_file_formats
     assert capabilities.supports_ddl_transactions is False
     assert capabilities.supports_transactions is False
 
@@ -494,7 +495,7 @@ def test_risingwave_load_job_file_scan_gcs_service_account(
     assert "file_scan(" in table_function
     assert "'parquet'" in table_function
     assert "'gcs'" in table_function
-    assert "'gs://test-bucket/data/file.parquet'" in table_function
+    assert "'gcs://test-bucket/data/file.parquet'" in table_function
     # Service account JSON should be in the function (via to_native_representation)
     assert "test-project" in table_function or "service_account" in table_function
 
@@ -516,7 +517,28 @@ def test_risingwave_load_job_file_scan_gcs_oauth(
     assert "'parquet'" in table_function
     assert "'gcs'" in table_function
     assert "'ya29.test_oauth_token'" in table_function
-    assert "'gs://test-bucket/data/file.parquet'" in table_function
+    assert "'gcs://test-bucket/data/file.parquet'" in table_function
+
+
+def test_risingwave_load_job_file_scan_gcs_normalization(
+    mock_staging_config_gcp_service_account: GcpServiceAccountCredentialsWithoutDefaults,
+) -> None:
+    """Test GCS URL normalization (scheme and path)."""
+    from urllib.parse import urlparse
+
+    job = _create_mock_job(mock_staging_config_gcp_service_account)
+
+    # Test scheme normalization (gs -> gcs) and path preservation (slashes are not collapsed)
+    test_cases = [
+        ("gs://test-bucket/data/file.parquet", "gcs://test-bucket/data/file.parquet"),
+        ("gs://test-bucket//data/file.parquet", "gcs://test-bucket//data/file.parquet"),
+        ("gcs://test-bucket///data/file.parquet", "gcs://test-bucket///data/file.parquet"),
+    ]
+
+    for input_url, expected_url in test_cases:
+        bucket_url = urlparse(input_url)
+        table_function = job._build_table_function(bucket_url, "file.parquet", "parquet")
+        assert f"'{expected_url}'" in table_function
 
 
 def test_risingwave_load_job_file_scan_azure(
