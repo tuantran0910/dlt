@@ -6,7 +6,7 @@ from dlt.common.data_writers.escape import (
     escape_postgres_literal,
 )
 from dlt.common.destination import Destination, DestinationCapabilitiesContext
-from dlt.common.destination.configuration import CsvFormatConfiguration
+from dlt.common.destination.configuration import CsvFormatConfiguration, ParquetFormatConfiguration
 from dlt.common.destination.typing import PreparedTableSchema
 from dlt.common.schema.typing import TColumnSchema, TTableSchema
 from dlt.common.typing import TLoaderFileFormat
@@ -156,9 +156,11 @@ class risingwave(Destination[RisingwaveClientConfiguration, "RisingwaveClient"])
         caps.is_max_text_data_type_length_in_bytes = True
         caps.supports_ddl_transactions = False
         caps.supports_transactions = False
+        caps.alter_add_multi_column = False
         caps.supported_merge_strategies = ["delete-insert"]
         caps.supported_replace_strategies = ["truncate-and-insert"]
         caps.sqlglot_dialect = "postgres"
+        caps.parquet_format = ParquetFormatConfiguration(supports_dictionary_encoding=False)
 
         return caps
 

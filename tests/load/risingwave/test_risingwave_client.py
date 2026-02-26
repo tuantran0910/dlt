@@ -41,6 +41,15 @@ def risingwave_client_config() -> RisingwaveClientConfiguration:
 
 
 @pytest.fixture
+def mock_risingwave_client(risingwave_client_config: RisingwaveClientConfiguration) -> RisingwaveClient:
+    schema = Schema("test_schema")
+    schema.update_table(utils.new_table("test_table"))
+    capabilities = risingwave().capabilities()
+    client = RisingwaveClient(schema, risingwave_client_config, capabilities)
+    return client
+
+
+@pytest.fixture
 def schema_with_hints() -> Schema:
     """Create a test schema with Risingwave-specific hints."""
     import json
@@ -93,6 +102,7 @@ def test_risingwave_capabilities() -> None:
     assert "parquet" in capabilities.supported_staging_file_formats
     assert capabilities.supports_ddl_transactions is False
     assert capabilities.supports_transactions is False
+    assert capabilities.alter_add_multi_column is False
 
 
 def test_risingwave_type_mapper() -> None:
@@ -436,7 +446,15 @@ def _create_mock_job(creds: Any) -> RisingwaveLoadJob:
     config.credentials.username = "root"
     config.dataset_name = "test_dataset"
 
-    return RisingwaveLoadJob(file_path, config, creds)
+    table_schema: PreparedTableSchema = {
+        "name": "my_table",
+        "columns": {
+            "id": {"name": "id", "data_type": "bigint"},
+            "name": {"name": "name", "data_type": "text"},
+        },
+    }
+
+    return RisingwaveLoadJob(file_path, table_schema, config, creds)
 
 
 def test_risingwave_load_job_file_scan_s3(
@@ -610,6 +628,64 @@ def test_risingwave_load_job_supported_file_formats() -> None:
     """Test that only parquet format is supported for staging."""
     assert RisingwaveLoadJob.SUPPORTED_FILE_FORMATS == ["parquet"]
     assert RisingwaveLoadJob.FILE_FORMAT_TO_RISINGWAVE_FORMAT_MAPPING == {"parquet": "parquet"}
+
+
+def test_risingwave_load_job_sql_generation_with_json_casts() -> None:
+    """Test that RisingwaveLoadJob generates SQL with explicit JSONB casts."""
+    from urllib.parse import urlparse
+
+    # Mock parameters
+    file_path = "test_client/tb_file.0.0.parquet"
+    table_schema: PreparedTableSchema = {
+        "name": "tb_file",
+        "columns": {
+            "id": {"name": "id", "data_type": "bigint"},
+            "metadata": {"name": "metadata", "data_type": "json"},
+            "created_at": {"name": "created_at", "data_type": "timestamp"},
+        },
+    }
+    config = RisingwaveClientConfiguration()
+    staging_credentials = MagicMock()
+
+    # Instantiate job
+    job = RisingwaveLoadJob(file_path, table_schema, config, staging_credentials)
+
+    # Mock client and sql_client
+    mock_job_client = MagicMock()
+    mock_sql_client = MagicMock()
+    job._job_client = mock_job_client
+    mock_job_client.sql_client = mock_sql_client
+
+    # Setup sql_client behavior
+    mock_sql_client.make_qualified_table_name.return_value = '"cake_ekyc"."tb_file"'
+    mock_sql_client.capabilities.escape_identifier.side_effect = lambda x: f'"{x}"'
+
+    # Mock ReferenceFollowupJobRequest and _build_table_function
+    with patch(
+        "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.is_reference_job",
+        return_value=True,
+    ), patch(
+        "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.resolve_reference",
+        return_value="gcs://bucket/dlt/file.parquet",
+    ), patch(
+        "dlt.destinations.impl.risingwave.risingwave.get_file_format_and_compression",
+        return_value=("parquet", None),
+    ), patch.object(
+        RisingwaveLoadJob, "_build_table_function", return_value="file_scan(...)"
+    ):
+
+        # Run the job
+        job.run()
+
+        # Verify execute_sql call
+        mock_sql_client.execute_sql.assert_called_once()
+        statement = mock_sql_client.execute_sql.call_args[0][0]
+
+        # Expected components
+        assert 'INSERT INTO "cake_ekyc"."tb_file"' in statement
+        assert '("id", "metadata", "created_at")' in statement
+        assert 'SELECT "id", "metadata"::jsonb, "created_at"' in statement
+        assert "FROM file_scan(...)" in statement
 
 
 # ==================== Tests for truncate_tables and file_format_selector ====================
@@ -890,10 +966,117 @@ def test_risingwave_sql_client_rw_implicit_flush_sql_format() -> None:
     # The SQL command should use the exact format from RisingWave docs
     expected_sql = "SET RW_IMPLICIT_FLUSH = true"
 
-    # Verify by checking the string that would be executed
-    # (we can't actually execute without a real connection)
-    assert expected_sql == "SET RW_IMPLICIT_FLUSH = true"
-    # Should use '=' not 'TO'
-    assert "TO" not in expected_sql.upper()
     # Should be 'RW_IMPLICIT_FLUSH' not 'implicit_flush'
     assert "RW_IMPLICIT_FLUSH" in expected_sql
+
+
+def test_risingwave_capabilities_parquet_dictionary_disabled() -> None:
+    """Test that Risingwave capabilities disable dictionary encoding for Parquet."""
+    caps = risingwave().capabilities()
+
+    assert caps.parquet_format is not None
+    assert caps.parquet_format.supports_dictionary_encoding is False
+
+
+def test_risingwave_load_job_init_initializes_load_table() -> None:
+    """Test that RisingwaveLoadJob initializes _load_table in the constructor."""
+    from dlt.destinations.impl.risingwave.risingwave import RisingwaveLoadJob
+    from dlt.destinations.impl.risingwave.configuration import RisingwaveClientConfiguration
+
+    table: PreparedTableSchema = {
+        "name": "test_table",
+        "columns": {"col1": {"name": "col1", "data_type": "text"}},
+    }
+    config = RisingwaveClientConfiguration()
+
+    job = RisingwaveLoadJob("/path/to/test_table.file_id.0.parquet", table, config, None)
+
+    # _load_table should be initialized
+    assert job._load_table == table
+    # load_table_name property should work
+    assert job.load_table_name == "test_table"
+
+
+def test_risingwave_load_job_sql_generation_multiple_json_columns() -> None:
+    """Test SQL generation with multiple JSON columns."""
+    from dlt.destinations.impl.risingwave.risingwave import RisingwaveLoadJob
+    from dlt.destinations.impl.risingwave.configuration import RisingwaveClientConfiguration
+
+    table: PreparedTableSchema = {
+        "name": "test_table",
+        "columns": {
+            "id": {"name": "id", "data_type": "bigint"},
+            "doc1": {"name": "doc1", "data_type": "json"},
+            "doc2": {"name": "doc2", "data_type": "json"},
+            "status": {"name": "status", "data_type": "text"},
+        },
+    }
+    config = RisingwaveClientConfiguration()
+    job = RisingwaveLoadJob("/path/to/test_table.file_id.0.parquet", table, config, None)
+
+    # Mock SQL client and related methods
+    mock_sql_client = MagicMock()
+    mock_sql_client.make_qualified_table_name.return_value = '"public"."test_table"'
+    mock_sql_client.capabilities.escape_identifier.side_effect = lambda x: f'"{x}"'
+
+    with patch(
+        "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.is_reference_job",
+        return_value=True,
+    ), patch(
+        "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.resolve_reference",
+        return_value="s3://bucket/test_table.file_id.0.parquet",
+    ), patch(
+        "dlt.destinations.impl.risingwave.risingwave.get_file_format_and_compression",
+        return_value=("parquet", None),
+    ), patch.object(
+        RisingwaveLoadJob, "_build_table_function", return_value="file_scan(...)"
+    ):
+        job._job_client = MagicMock()
+        job._job_client.sql_client = mock_sql_client
+
+        job.run()
+
+        # Verify execute_sql call
+        mock_sql_client.execute_sql.assert_called_once()
+        statement = mock_sql_client.execute_sql.call_args[0][0]
+
+        # Expected components
+        assert 'INSERT INTO "public"."test_table"' in statement
+        assert '("id", "doc1", "doc2", "status")' in statement
+        assert 'SELECT "id", "doc1"::jsonb, "doc2"::jsonb, "status"' in statement
+        assert "FROM file_scan(...)" in statement
+
+
+def test_risingwave_alter_table_multi_column_disabled(mock_risingwave_client: RisingwaveClient) -> None:
+    """Test that Adding multiple columns generates separate ALTER TABLE statements."""
+    new_columns: List[TColumnSchema] = [
+        {"name": "new_col1", "data_type": "text", "nullable": True},
+        {"name": "new_col2", "data_type": "bigint", "nullable": False},
+    ]
+    
+    # generate_alter=True means table already exists
+    sql_statements = mock_risingwave_client._get_table_update_sql("test_table", new_columns, generate_alter=True)
+    
+    # We expect 2 separate ALTER TABLE statements because alter_add_multi_column is False
+    assert len(sql_statements) == 2
+    assert "ADD COLUMN" in sql_statements[0]
+    assert "ADD COLUMN" in sql_statements[1]
+    assert "ALTER TABLE" in sql_statements[0]
+    assert "ALTER TABLE" in sql_statements[1]
+
+def test_risingwave_create_table_multi_column_enabled(mock_risingwave_client: RisingwaveClient) -> None:
+    """Test that Creating a table with multiple columns still uses a single CREATE TABLE statement."""
+    new_columns: List[TColumnSchema] = [
+        {"name": "col1", "data_type": "text", "nullable": True},
+        {"name": "col2", "data_type": "bigint", "nullable": False},
+    ]
+    
+    # generate_alter=False means CREATE TABLE
+    sql_statements = mock_risingwave_client._get_table_update_sql("test_table", new_columns, generate_alter=False)
+    
+    # Should be one CREATE TABLE statement with columns joined by comma
+    assert len(sql_statements) == 1
+    assert "CREATE TABLE" in sql_statements[0]
+    assert '"col1" varchar' in sql_statements[0]
+    assert '"col2" bigint' in sql_statements[0]
+    assert "NOT NULL" in sql_statements[0]

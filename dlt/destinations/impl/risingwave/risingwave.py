@@ -72,11 +72,13 @@ class RisingwaveLoadJob(RunnableLoadJob, HasFollowupJobs):
     def __init__(
         self,
         file_path: str,
+        table: PreparedTableSchema,
         config: RisingwaveClientConfiguration,
         staging_credentials: TStagingCredentials,
     ) -> None:
         super().__init__(file_path)
         self._job_client: Optional["RisingwaveClient"] = None
+        self._load_table = table
         self._config = config
         self._staging_credentials = staging_credentials
 
@@ -111,7 +113,26 @@ class RisingwaveLoadJob(RunnableLoadJob, HasFollowupJobs):
         table_function = self._build_table_function(bucket_url, file_name, risingwave_format)
 
         qualified_table_name = client.make_qualified_table_name(self.load_table_name)
-        statement = f"INSERT INTO {qualified_table_name} SELECT * FROM {table_function}"
+
+        # Build explicit column list for INSERT and SELECT
+        # We need this to apply ::jsonb casts for JSON columns since Risingwave's
+        # file_scan() returns Parquet string columns as varchar and doesn't auto-cast.
+        column_names = []
+        select_expressions = []
+        for col_name, col_schema in self._load_table["columns"].items():
+            escaped_col = client.capabilities.escape_identifier(col_name)
+            column_names.append(escaped_col)
+
+            # Apply cast for JSON columns
+            if col_schema["data_type"] == "json":
+                select_expressions.append(f"{escaped_col}::jsonb")
+            else:
+                select_expressions.append(escaped_col)
+
+        columns_clause = f"({', '.join(column_names)})"
+        select_clause = f"{', '.join(select_expressions)}"
+
+        statement = f"INSERT INTO {qualified_table_name} {columns_clause} SELECT {select_clause} FROM {table_function}"
 
         with client.begin_transaction():
             client.execute_sql(statement)
@@ -435,7 +456,7 @@ class RisingwaveClient(InsertValuesJobClient, SupportsStagingDestination):
                 staging_credentials,
                 (AwsCredentialsWithoutDefaults, GcpCredentials, AzureCredentialsWithoutDefaults),
             ):
-                job = RisingwaveLoadJob(file_path, self.config, staging_credentials)
+                job = RisingwaveLoadJob(file_path, table, self.config, staging_credentials)
 
         return job
 
