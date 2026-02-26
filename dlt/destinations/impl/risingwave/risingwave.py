@@ -132,7 +132,10 @@ class RisingwaveLoadJob(RunnableLoadJob, HasFollowupJobs):
         columns_clause = f"({', '.join(column_names)})"
         select_clause = f"{', '.join(select_expressions)}"
 
-        statement = f"INSERT INTO {qualified_table_name} {columns_clause} SELECT {select_clause} FROM {table_function}"
+        statement = (
+            f"INSERT INTO {qualified_table_name} {columns_clause} SELECT {select_clause} FROM"
+            f" {table_function}"
+        )
 
         with client.begin_transaction():
             client.execute_sql(statement)

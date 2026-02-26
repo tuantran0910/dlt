@@ -41,7 +41,9 @@ def risingwave_client_config() -> RisingwaveClientConfiguration:
 
 
 @pytest.fixture
-def mock_risingwave_client(risingwave_client_config: RisingwaveClientConfiguration) -> RisingwaveClient:
+def mock_risingwave_client(
+    risingwave_client_config: RisingwaveClientConfiguration,
+) -> RisingwaveClient:
     schema = Schema("test_schema")
     schema.update_table(utils.new_table("test_table"))
     capabilities = risingwave().capabilities()
@@ -661,19 +663,21 @@ def test_risingwave_load_job_sql_generation_with_json_casts() -> None:
     mock_sql_client.capabilities.escape_identifier.side_effect = lambda x: f'"{x}"'
 
     # Mock ReferenceFollowupJobRequest and _build_table_function
-    with patch(
-        "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.is_reference_job",
-        return_value=True,
-    ), patch(
-        "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.resolve_reference",
-        return_value="gcs://bucket/dlt/file.parquet",
-    ), patch(
-        "dlt.destinations.impl.risingwave.risingwave.get_file_format_and_compression",
-        return_value=("parquet", None),
-    ), patch.object(
-        RisingwaveLoadJob, "_build_table_function", return_value="file_scan(...)"
+    with (
+        patch(
+            "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.is_reference_job",
+            return_value=True,
+        ),
+        patch(
+            "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.resolve_reference",
+            return_value="gcs://bucket/dlt/file.parquet",
+        ),
+        patch(
+            "dlt.destinations.impl.risingwave.risingwave.get_file_format_and_compression",
+            return_value=("parquet", None),
+        ),
+        patch.object(RisingwaveLoadJob, "_build_table_function", return_value="file_scan(...)"),
     ):
-
         # Run the job
         job.run()
 
@@ -1019,17 +1023,20 @@ def test_risingwave_load_job_sql_generation_multiple_json_columns() -> None:
     mock_sql_client.make_qualified_table_name.return_value = '"public"."test_table"'
     mock_sql_client.capabilities.escape_identifier.side_effect = lambda x: f'"{x}"'
 
-    with patch(
-        "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.is_reference_job",
-        return_value=True,
-    ), patch(
-        "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.resolve_reference",
-        return_value="s3://bucket/test_table.file_id.0.parquet",
-    ), patch(
-        "dlt.destinations.impl.risingwave.risingwave.get_file_format_and_compression",
-        return_value=("parquet", None),
-    ), patch.object(
-        RisingwaveLoadJob, "_build_table_function", return_value="file_scan(...)"
+    with (
+        patch(
+            "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.is_reference_job",
+            return_value=True,
+        ),
+        patch(
+            "dlt.destinations.impl.risingwave.risingwave.ReferenceFollowupJobRequest.resolve_reference",
+            return_value="s3://bucket/test_table.file_id.0.parquet",
+        ),
+        patch(
+            "dlt.destinations.impl.risingwave.risingwave.get_file_format_and_compression",
+            return_value=("parquet", None),
+        ),
+        patch.object(RisingwaveLoadJob, "_build_table_function", return_value="file_scan(...)"),
     ):
         job._job_client = MagicMock()
         job._job_client.sql_client = mock_sql_client
@@ -1047,16 +1054,20 @@ def test_risingwave_load_job_sql_generation_multiple_json_columns() -> None:
         assert "FROM file_scan(...)" in statement
 
 
-def test_risingwave_alter_table_multi_column_disabled(mock_risingwave_client: RisingwaveClient) -> None:
+def test_risingwave_alter_table_multi_column_disabled(
+    mock_risingwave_client: RisingwaveClient,
+) -> None:
     """Test that Adding multiple columns generates separate ALTER TABLE statements."""
     new_columns: List[TColumnSchema] = [
         {"name": "new_col1", "data_type": "text", "nullable": True},
         {"name": "new_col2", "data_type": "bigint", "nullable": False},
     ]
-    
+
     # generate_alter=True means table already exists
-    sql_statements = mock_risingwave_client._get_table_update_sql("test_table", new_columns, generate_alter=True)
-    
+    sql_statements = mock_risingwave_client._get_table_update_sql(
+        "test_table", new_columns, generate_alter=True
+    )
+
     # We expect 2 separate ALTER TABLE statements because alter_add_multi_column is False
     assert len(sql_statements) == 2
     assert "ADD COLUMN" in sql_statements[0]
@@ -1064,16 +1075,21 @@ def test_risingwave_alter_table_multi_column_disabled(mock_risingwave_client: Ri
     assert "ALTER TABLE" in sql_statements[0]
     assert "ALTER TABLE" in sql_statements[1]
 
-def test_risingwave_create_table_multi_column_enabled(mock_risingwave_client: RisingwaveClient) -> None:
+
+def test_risingwave_create_table_multi_column_enabled(
+    mock_risingwave_client: RisingwaveClient,
+) -> None:
     """Test that Creating a table with multiple columns still uses a single CREATE TABLE statement."""
     new_columns: List[TColumnSchema] = [
         {"name": "col1", "data_type": "text", "nullable": True},
         {"name": "col2", "data_type": "bigint", "nullable": False},
     ]
-    
+
     # generate_alter=False means CREATE TABLE
-    sql_statements = mock_risingwave_client._get_table_update_sql("test_table", new_columns, generate_alter=False)
-    
+    sql_statements = mock_risingwave_client._get_table_update_sql(
+        "test_table", new_columns, generate_alter=False
+    )
+
     # Should be one CREATE TABLE statement with columns joined by comma
     assert len(sql_statements) == 1
     assert "CREATE TABLE" in sql_statements[0]

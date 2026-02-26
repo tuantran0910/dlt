@@ -6,6 +6,7 @@ from dlt.common.destination import DestinationCapabilitiesContext
 from dlt.common.destination.configuration import ParquetFormatConfiguration
 from dlt.common.data_writers.writers import ParquetDataWriter
 
+
 def test_parquet_writer_dictionary_encoding_config() -> None:
     # 1. Test with supports_dictionary_encoding = True (default)
     caps = DestinationCapabilitiesContext.generic_capabilities("parquet")
@@ -16,7 +17,7 @@ def test_parquet_writer_dictionary_encoding_config() -> None:
             # We need to mock columns_to_arrow as well since write_header calls it
             with patch("dlt.common.libs.pyarrow.columns_to_arrow", return_value=MagicMock()):
                 writer = ParquetDataWriter(f, caps=caps)
-                writer.write_header({}) # Empty schema
+                writer.write_header({})  # Empty schema
                 mock_writer.assert_called_once()
                 args, kwargs = mock_writer.call_args
                 assert kwargs["use_dictionary"] is True
