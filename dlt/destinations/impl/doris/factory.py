@@ -161,11 +161,10 @@ class doris(Destination[DorisClientConfiguration, "DorisClient"]):
         caps.supports_ddl_transactions = False
         caps.supports_transactions = True
         caps.alter_add_multi_column = True
-        caps.supported_merge_strategies = ["delete-insert", "upsert", "scd2"]
+        caps.supported_merge_strategies = ["delete-insert", "upsert"]
         caps.supported_replace_strategies = [
             "truncate-and-insert",
             "insert-from-staging",
-            "staging-optimized",
         ]
         caps.sqlglot_dialect = "doris"
         caps.naming_convention = "dlt.destinations.impl.doris.naming"
@@ -182,6 +181,8 @@ class doris(Destination[DorisClientConfiguration, "DorisClient"]):
         self,
         credentials: Union[DorisCredentials, Dict[str, Any], str] = None,
         create_indexes: bool = False,
+        broker_load_access_key: Optional[str] = None,
+        broker_load_secret_key: Optional[str] = None,
         destination_name: Optional[str] = None,
         environment: Optional[str] = None,
         **kwargs: Any,
@@ -196,6 +197,12 @@ class doris(Destination[DorisClientConfiguration, "DorisClient"]):
                 a dict, or a connection string like ``mysql+pymysql://user:pass@host:9030/db``.
             create_indexes: Whether UNIQUE KEY constraints should be created for primary
                 key columns. Defaults to False.
+            broker_load_access_key: Access key for Broker Load operations. When set,
+                overrides the automatically-detected key from staging credentials.
+                Required when using HMAC keys for GCS or when staging and Broker Load
+                credentials differ. Must be set together with broker_load_secret_key.
+            broker_load_secret_key: Secret key for Broker Load operations. Must be set
+                together with broker_load_access_key to take effect.
             destination_name: Name of the destination.
             environment: Environment of the destination.
             **kwargs: Additional arguments passed to the destination config.
@@ -203,6 +210,8 @@ class doris(Destination[DorisClientConfiguration, "DorisClient"]):
         super().__init__(
             credentials=credentials,
             create_indexes=create_indexes,
+            broker_load_access_key=broker_load_access_key,
+            broker_load_secret_key=broker_load_secret_key,
             destination_name=destination_name,
             environment=environment,
             **kwargs,

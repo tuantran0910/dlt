@@ -1,9 +1,11 @@
 import secrets
 import time
-from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING, Union, cast
+import warnings
+from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING, Union
 from urllib.parse import urlparse
 
 from dlt.common import logger
+
 from dlt.common.configuration.specs import (
     AwsCredentialsWithoutDefaults,
     GcpCredentials,
@@ -42,6 +44,15 @@ if TYPE_CHECKING:
     pass
 
 import sqlalchemy as sa
+
+# Suppress SQLAlchemy warnings about unknown Doris-specific DDL during schema reflection
+# Doris uses non-standard SQL extensions (DUPLICATE KEY, DISTRIBUTED BY, etc.) that
+# SQLAlchemy's MySQL dialect doesn't recognize, but these are harmless.
+warnings.filterwarnings(
+    "ignore",
+    message="Unknown schema content",
+    category=Warning,
+)
 
 
 TStagingCredentials = Union[
@@ -131,7 +142,8 @@ class DorisBrokerLoadJob(RunnableLoadJob, HasFollowupJobs):
         """Build the LOAD LABEL SQL statement for Broker Load."""
         client = self._job_client.sql_client
         db_name = client.dataset_name
-        table_name = client.make_qualified_table_name(self.load_table_name)
+        # Doris LOAD INTO TABLE does not accept database-qualified names, use table name only
+        table_name = self._job_client.capabilities.escape_identifier(self.load_table_name)
 
         # Build column list
         column_names = []
@@ -167,8 +179,74 @@ class DorisBrokerLoadJob(RunnableLoadJob, HasFollowupJobs):
         return sql
 
     def _build_with_clause(self, scheme: str) -> str:
-        """Build the WITH S3/HDFS clause based on the storage provider."""
+        """Build the WITH S3/HDFS clause based on the storage provider.
+
+        Uses staging credentials configured in dlt's filesystem destination configuration.
+        For example, users configure credentials in .dlt/secrets.toml:
+
+            [destination.filesystem.credentials]
+            aws_access_key_id = "..."
+            aws_secret_access_key = "..."
+
+        These same credentials are automatically used by Doris Broker Load.
+
+        When broker_load_access_key and broker_load_secret_key are set on the config,
+        they override the automatically-detected keys (useful when the staging credentials
+        don't match the bucket scheme or when using different HMAC keys for Broker Load).
+        """
         creds = self._staging_credentials
+        override_access_key = getattr(self._config, "broker_load_access_key", None)
+        override_secret_key = getattr(self._config, "broker_load_secret_key", None)
+
+        # If both overrides are set, use them regardless of credential type
+        if override_access_key and override_secret_key:
+            if scheme == "s3":
+                region = getattr(creds, "region_name", "us-east-1") or "us-east-1"
+                endpoint = getattr(creds, "endpoint_url", None) or f"s3.{region}.amazonaws.com"
+                return (
+                    "WITH S3 (\n"
+                    '    "provider" = "S3",\n'
+                    f'    "s3.endpoint" = "https://{endpoint}",\n'
+                    f'    "s3.access_key" = "{override_access_key}",\n'
+                    f'    "s3.secret_key" = "{override_secret_key}",\n'
+                    f'    "s3.region" = "{region}"\n'
+                    ")"
+                )
+
+            elif scheme in ("gs", "gcs"):
+                return (
+                    "WITH S3 (\n"
+                    '    "provider" = "GCP",\n'
+                    '    "s3.endpoint" = "https://storage.googleapis.com",\n'
+                    f'    "s3.access_key" = "{override_access_key}",\n'
+                    f'    "s3.secret_key" = "{override_secret_key}",\n'
+                    '    "s3.region" = "auto"\n'
+                    ")"
+                )
+
+            elif scheme in ("az", "abfs"):
+                account_name = getattr(creds, "azure_storage_account_name", "")
+                endpoint = getattr(
+                    creds,
+                    "azure_account_host",
+                    f"{account_name}.blob.core.windows.net",
+                )
+                return (
+                    "WITH S3 (\n"
+                    '    "provider" = "AZURE",\n'
+                    f'    "s3.endpoint" = "https://{endpoint}",\n'
+                    f'    "s3.access_key" = "{override_access_key}",\n'
+                    f'    "s3.secret_key" = "{override_secret_key}",\n'
+                    '    "s3.region" = "auto"\n'
+                    ")"
+                )
+
+            else:
+                raise LoadJobTerminalException(
+                    self._file_path,
+                    f"Doris Broker Load does not support `{scheme}` scheme with the provided"
+                    " credentials. Supported: S3 (s3://), GCS (gs://), Azure (az://, abfs://).",
+                )
 
         if scheme == "s3" and isinstance(creds, AwsCredentialsWithoutDefaults):
             access_key = creds.aws_access_key_id
@@ -183,30 +261,49 @@ class DorisBrokerLoadJob(RunnableLoadJob, HasFollowupJobs):
             return (
                 "WITH S3 (\n"
                 '    "provider" = "S3",\n'
-                f'    "AWS_ENDPOINT" = "{endpoint}",\n'
-                f'    "AWS_ACCESS_KEY" = "{access_key}",\n'
-                f'    "AWS_SECRET_KEY" = "{secret_key}",\n'
-                f'    "AWS_REGION" = "{region}"\n'
+                f'    "s3.endpoint" = "https://{endpoint}",\n'
+                f'    "s3.access_key" = "{access_key}",\n'
+                f'    "s3.secret_key" = "{secret_key}",\n'
+                f'    "s3.region" = "{region}"\n'
                 ")"
             )
 
         elif scheme in ("gs", "gcs") and isinstance(creds, GcpCredentials):
-            # GCS via S3-compatible API with GCP provider
+            # GCS via GCP provider with service account credentials (Doris v2.0+ syntax)
+            # For GCS, we need to pass the full service account JSON as the secret key
+            from dlt.common.json import json
+
             project_id = getattr(creds, "project_id", "")
-            # For GCS with Broker Load, Doris uses the S3 protocol with GCP provider
-            # We need to extract the service account credentials
-            try:
-                service_account_json = creds.to_native_representation()
-            except Exception:
-                service_account_json = ""
+
+            # For GcpServiceAccountCredentialsWithoutDefaults, serialize the full credentials
+            if hasattr(creds, "private_key") and hasattr(creds, "client_email"):
+                # Service account credentials - serialize to JSON
+                service_account_dict = {
+                    "type": "service_account",
+                    "project_id": project_id,
+                    "private_key_id": getattr(creds, "private_key_id", ""),
+                    "private_key": getattr(creds, "private_key", ""),
+                    "client_email": getattr(creds, "client_email", ""),
+                    "client_id": getattr(creds, "client_id", ""),
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+                # Remove empty values to keep the JSON clean
+                service_account_dict = {k: v for k, v in service_account_dict.items() if v}
+                secret_key = json.dumps(service_account_dict)
+                # Escape double quotes for SQL string literal
+                secret_key = secret_key.replace('"', '\\"')
+            else:
+                # OAuth or default credentials - only project ID is available
+                secret_key = ""
 
             return (
                 "WITH S3 (\n"
                 '    "provider" = "GCP",\n'
-                '    "AWS_ENDPOINT" = "storage.googleapis.com",\n'
-                f'    "AWS_ACCESS_KEY" = "{project_id}",\n'
-                f'    "AWS_SECRET_KEY" = "{service_account_json}",\n'
-                '    "AWS_REGION" = "auto"\n'
+                '    "s3.endpoint" = "https://storage.googleapis.com",\n'
+                f'    "s3.access_key" = "{project_id}",\n'
+                f'    "s3.secret_key" = "{secret_key}",\n'
+                '    "s3.region" = "auto"\n'
                 ")"
             )
 
@@ -222,10 +319,10 @@ class DorisBrokerLoadJob(RunnableLoadJob, HasFollowupJobs):
             return (
                 "WITH S3 (\n"
                 '    "provider" = "AZURE",\n'
-                f'    "AWS_ENDPOINT" = "{endpoint}",\n'
-                f'    "AWS_ACCESS_KEY" = "{account_name}",\n'
-                f'    "AWS_SECRET_KEY" = "{account_key}",\n'
-                '    "AWS_REGION" = "auto"\n'
+                f'    "s3.endpoint" = "https://{endpoint}",\n'
+                f'    "s3.access_key" = "{account_name}",\n'
+                f'    "s3.secret_key" = "{account_key}",\n'
+                '    "s3.region" = "auto"\n'
                 ")"
             )
 
@@ -560,65 +657,3 @@ class DorisClient(InsertValuesJobClient, SqlalchemyJobClient, SupportsStagingDes
         self, table_chain: Sequence[PreparedTableSchema]
     ) -> List["FollowupJobRequest"]:
         return []
-
-    def _create_replace_followup_jobs(
-        self, table_chain: Sequence[PreparedTableSchema]
-    ) -> List["FollowupJobRequest"]:
-        """Create replace followup jobs.
-
-        For staging-optimized strategy, uses ALTER TABLE REPLACE WITH TABLE.
-        """
-        if self._get_replace_strategy(table_chain) == "staging-optimized":
-            return [DorisStagingOptimizedReplaceJob.from_table_chain(table_chain, self.sql_client)]
-        return super()._create_replace_followup_jobs(table_chain)
-
-    def _get_replace_strategy(self, table_chain: Sequence[PreparedTableSchema]) -> str:
-        """Determine the replace strategy for the given table chain."""
-        if table_chain and table_chain[0].get("write_disposition") == "replace":
-            replace_strategy = table_chain[0].get("x-replace-strategy")
-            if replace_strategy:
-                return cast(str, replace_strategy)
-        return "truncate-and-insert"
-
-
-class DorisStagingOptimizedReplaceJob(SqlMergeFollowupJob):
-    """Replace job that uses ALTER TABLE REPLACE WITH TABLE for atomic swap.
-
-    This is the staging-optimized replace strategy for Doris. It atomically
-    swaps the staging table with the production table using:
-
-        ALTER TABLE `db`.`table` REPLACE WITH TABLE `db`.`staging_table`
-        PROPERTIES('swap' = 'true')
-
-    After the swap, the old data ends up in the staging table (which is typically
-    dropped later), and the new data is in the production table.
-    """
-
-    @classmethod
-    def gen_key_table_clauses(
-        cls,
-        root_table_name: str,
-        staging_root_table_name: str,
-        key_clauses: Sequence[str],
-        for_delete: bool,
-    ) -> List[str]:
-        """Not used for staging-optimized replace."""
-        return []
-
-    @classmethod
-    def generate_sql(
-        cls,
-        table_chain: Sequence[PreparedTableSchema],
-        sql_client: Any,
-        params: Optional[Any] = None,
-    ) -> List[str]:
-        """Generate ALTER TABLE REPLACE WITH TABLE SQL statements."""
-        sql_statements = []
-        for table in table_chain:
-            table_name = sql_client.make_qualified_table_name(table["name"])
-            staging_table_name = sql_client.make_qualified_table_name(table["name"], staging=True)
-            sql_statements.append(
-                f"ALTER TABLE {table_name} REPLACE WITH TABLE {staging_table_name}"
-                " PROPERTIES('swap' = 'true');"
-            )
-        return sql_statements

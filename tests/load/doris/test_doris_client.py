@@ -42,10 +42,10 @@ def test_doris_destination_capabilities() -> None:
     assert caps.supports_transactions is True
     assert "delete-insert" in caps.supported_merge_strategies
     assert "upsert" in caps.supported_merge_strategies
-    assert "scd2" in caps.supported_merge_strategies
+    assert "scd2" not in caps.supported_merge_strategies
     assert "truncate-and-insert" in caps.supported_replace_strategies
     assert "insert-from-staging" in caps.supported_replace_strategies
-    assert "staging-optimized" in caps.supported_replace_strategies
+    assert "staging-optimized" not in caps.supported_replace_strategies
     assert caps.has_case_sensitive_identifiers is False
     assert caps.max_identifier_length == 64
     assert caps.alter_add_multi_column is True
@@ -387,6 +387,8 @@ def test_doris_broker_load_build_with_clause_s3() -> None:
     mock_config.broker_load_timeout = 3600
     mock_config.broker_load_poll_interval = 5.0
     mock_config.broker_load_max_filter_ratio = 0.0
+    mock_config.broker_load_access_key = None
+    mock_config.broker_load_secret_key = None
 
     job = DorisBrokerLoadJob.__new__(DorisBrokerLoadJob)
     job._config = mock_config
@@ -409,3 +411,180 @@ def test_doris_broker_load_build_with_clause_s3() -> None:
     assert '"provider" = "S3"' in with_clause
     assert "AKIAIOSFODNN7EXAMPLE" in with_clause
     assert "us-east-1" in with_clause
+
+
+def test_doris_broker_load_build_with_clause_gcp() -> None:
+    """Test GCP WITH clause generation with service account credentials."""
+    mock_config = MagicMock()
+    mock_config.broker_load_timeout = 3600
+    mock_config.broker_load_poll_interval = 5.0
+    mock_config.broker_load_max_filter_ratio = 0.0
+    mock_config.broker_load_access_key = None
+    mock_config.broker_load_secret_key = None
+
+    job = DorisBrokerLoadJob.__new__(DorisBrokerLoadJob)
+    job._config = mock_config
+
+    # Mock GCP service account credentials
+    from dlt.common.configuration.specs import GcpServiceAccountCredentialsWithoutDefaults
+
+    gcp_creds = MagicMock(spec=GcpServiceAccountCredentialsWithoutDefaults)
+    gcp_creds.project_id = "test-project"
+    gcp_creds.private_key = "-----BEGIN RSA PRIVATE KEY-----\ntest_key\n-----END RSA PRIVATE KEY-----"
+    gcp_creds.private_key_id = "test_key_id"
+    gcp_creds.client_email = "test@test-project.iam.gserviceaccount.com"
+    gcp_creds.client_id = "123456789"
+
+    job._staging_credentials = gcp_creds
+
+    with_clause = job._build_with_clause("gs")
+    assert '"provider" = "GCP"' in with_clause
+    assert '"s3.endpoint" = "https://storage.googleapis.com"' in with_clause
+    assert '"s3.access_key" = "test-project"' in with_clause
+    assert "test-project.iam.gserviceaccount.com" in with_clause
+    assert '"s3.region" = "auto"' in with_clause
+
+
+def test_doris_broker_load_into_table_unqualified() -> None:
+    """Test that INTO TABLE clause uses unqualified table name (no database prefix).
+
+    Doris LOAD statement does not accept database-qualified table names
+    in the INTO TABLE clause - the database is inferred from LOAD LABEL.
+    """
+    mock_table = {
+        "name": "test_table",
+        "columns": {
+            "id": {"name": "id", "data_type": "bigint"},
+            "value": {"name": "value", "data_type": "text"},
+        },
+    }
+    mock_config = MagicMock()
+    mock_config.broker_load_timeout = 3600
+    mock_config.broker_load_poll_interval = 5.0
+    mock_config.broker_load_max_filter_ratio = 0.0
+    mock_config.broker_load_access_key = None
+    mock_config.broker_load_secret_key = None
+
+    # Mock the job client with capabilities and sql_client
+    mock_job_client = MagicMock()
+    mock_job_client.capabilities = MagicMock()
+    mock_job_client.capabilities.escape_identifier = escape_doris_identifier
+    mock_job_client.sql_client = MagicMock()
+    mock_job_client.sql_client.dataset_name = "my_dataset"
+
+    job = DorisBrokerLoadJob.__new__(DorisBrokerLoadJob)
+    job._load_table = cast(PreparedTableSchema, mock_table)
+    job._config = mock_config
+    job._job_client = mock_job_client
+
+    # Mock AWS credentials
+    aws_creds = MagicMock()
+    aws_creds.aws_access_key_id = "AKIAIOSFODNN7EXAMPLE"
+    aws_creds.aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    aws_creds.region_name = "us-east-1"
+    aws_creds.endpoint_url = None
+    from dlt.common.configuration.specs import AwsCredentialsWithoutDefaults
+
+    job._staging_credentials = aws_creds
+    job._staging_credentials.__class__ = AwsCredentialsWithoutDefaults  # type: ignore[assignment]
+
+    # Build the broker load SQL
+    sql = job._build_broker_load_sql("test_label", "s3://bucket/file.parquet", "s3", "parquet")
+
+    # Verify INTO TABLE clause uses unqualified table name
+    assert "INTO TABLE `test_table`" in sql
+    # Make sure it does NOT have database-qualified name
+    assert "INTO TABLE `my_dataset`.`test_table`" not in sql
+    # Verify column list is present
+    assert "`id`" in sql
+    assert "`value`" in sql
+    # Verify LOAD LABEL has proper database context
+    assert "LOAD LABEL `my_dataset`" in sql
+    # Verify FORMAT clause
+    assert 'FORMAT AS "PARQUET"' in sql
+
+
+def test_doris_broker_load_with_clause_override_credentials_gcs() -> None:
+    """Test Broker Load WITH clause with override credentials for GCS.
+
+    When broker_load_access_key and broker_load_secret_key are set on the config,
+    they should override the keys derived from staging credentials.
+    """
+    mock_config = MagicMock()
+    mock_config.broker_load_timeout = 3600
+    mock_config.broker_load_poll_interval = 5.0
+    mock_config.broker_load_max_filter_ratio = 0.0
+    # Set the override credentials
+    mock_config.broker_load_access_key = "GOOG_HMAC_ACCESS_KEY"
+    mock_config.broker_load_secret_key = "GOOG_HMAC_SECRET_KEY"
+
+    job = DorisBrokerLoadJob.__new__(DorisBrokerLoadJob)
+    job._config = mock_config
+    job._file_path = "test_file.reference"
+
+    # Mock GCP service account credentials (staging)
+    from dlt.common.configuration.specs import GcpServiceAccountCredentialsWithoutDefaults
+
+    gcp_creds = MagicMock(spec=GcpServiceAccountCredentialsWithoutDefaults)
+    gcp_creds.project_id = "test-project"
+    gcp_creds.private_key = "-----BEGIN RSA PRIVATE KEY-----\ntest_key\n-----END RSA PRIVATE KEY-----"
+    gcp_creds.private_key_id = "test_key_id"
+    gcp_creds.client_email = "test@test-project.iam.gserviceaccount.com"
+    gcp_creds.client_id = "123456789"
+
+    job._staging_credentials = gcp_creds
+
+    # Build WITH clause for GCS bucket
+    with_clause = job._build_with_clause("gs")
+
+    # Verify it uses GCP provider with GCS endpoint
+    assert '"provider" = "GCP"' in with_clause
+    assert '"s3.endpoint" = "https://storage.googleapis.com"' in with_clause
+    # Verify it uses the OVERRIDE keys, not the service account keys
+    assert '"s3.access_key" = "GOOG_HMAC_ACCESS_KEY"' in with_clause
+    assert '"s3.secret_key" = "GOOG_HMAC_SECRET_KEY"' in with_clause
+    # Should NOT contain the service account email
+    assert "test-project.iam.gserviceaccount.com" not in with_clause
+    assert '"s3.region" = "auto"' in with_clause
+
+
+def test_doris_broker_load_with_clause_override_credentials_wrong_type() -> None:
+    """Test Broker Load WITH clause with override when staging creds don't match bucket scheme.
+
+    User has AWS credentials in .dlt/secrets.toml (for staging), but wants to use
+    GCS with HMAC keys for Broker Load. Override credentials allow this.
+    """
+    mock_config = MagicMock()
+    mock_config.broker_load_timeout = 3600
+    mock_config.broker_load_poll_interval = 5.0
+    mock_config.broker_load_max_filter_ratio = 0.0
+    # Set the override HMAC credentials for GCS
+    mock_config.broker_load_access_key = "GOOG_HMAC_ACCESS_KEY"
+    mock_config.broker_load_secret_key = "GOOG_HMAC_SECRET_KEY"
+
+    job = DorisBrokerLoadJob.__new__(DorisBrokerLoadJob)
+    job._config = mock_config
+    job._file_path = "test_file.reference"
+
+    # Use AWS credentials for staging (wrong type for GCS)
+    aws_creds = MagicMock()
+    aws_creds.aws_access_key_id = "AKIAIOSFODNN7EXAMPLE"
+    aws_creds.aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    aws_creds.region_name = "us-east-1"
+    aws_creds.endpoint_url = None
+    from dlt.common.configuration.specs import AwsCredentialsWithoutDefaults
+
+    job._staging_credentials = aws_creds
+    job._staging_credentials.__class__ = AwsCredentialsWithoutDefaults  # type: ignore[assignment]
+
+    # Build WITH clause for GCS bucket (mismatched credential type)
+    # With overrides set, this should succeed
+    with_clause = job._build_with_clause("gs")
+
+    # Verify it uses GCP provider (from scheme, not from credentials type)
+    assert '"provider" = "GCP"' in with_clause
+    assert '"s3.endpoint" = "https://storage.googleapis.com"' in with_clause
+    # Verify it uses the OVERRIDE keys
+    assert '"s3.access_key" = "GOOG_HMAC_ACCESS_KEY"' in with_clause
+    assert '"s3.secret_key" = "GOOG_HMAC_SECRET_KEY"' in with_clause
+    assert '"s3.region" = "auto"' in with_clause

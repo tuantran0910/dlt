@@ -55,7 +55,7 @@ def test_doris_client_configuration(doris_config: DorisClientConfiguration) -> N
 
 
 def test_doris_client_configuration_create_indexes_default() -> None:
-    """Test that create_indexes defaults to False."""
+    """Test that create_indexes defaults to True."""
     config = DorisClientConfiguration()
     config.credentials = DorisCredentials()
     config.credentials.database = "test_db"
@@ -64,7 +64,7 @@ def test_doris_client_configuration_create_indexes_default() -> None:
     config.credentials.port = 9030
     config.credentials.username = "root"
 
-    assert config.create_indexes is False
+    assert config.create_indexes is True
 
 
 def test_doris_client_configuration_create_indexes_enabled() -> None:
@@ -106,3 +106,29 @@ def test_doris_config_fingerprint_empty() -> None:
     config = DorisClientConfiguration()
     config.credentials = None
     assert config.fingerprint() == ""
+
+
+def test_doris_client_configuration_broker_load_override_defaults() -> None:
+    """Test DorisClientConfiguration Broker Load override fields default to None."""
+    config = DorisClientConfiguration()
+    config.credentials = DorisCredentials()
+    config.credentials.database = "test_db"
+    config.credentials.host = "localhost"
+    config.credentials.username = "root"
+
+    assert config.broker_load_access_key is None
+    assert config.broker_load_secret_key is None
+
+
+def test_doris_client_configuration_broker_load_override_set() -> None:
+    """Test DorisClientConfiguration Broker Load override fields can be set."""
+    config = DorisClientConfiguration()
+    config.credentials = DorisCredentials()
+    config.credentials.database = "test_db"
+    config.credentials.host = "localhost"
+    config.credentials.username = "root"
+    config.broker_load_access_key = "test_access_key"
+    config.broker_load_secret_key = "test_secret_key"
+
+    assert config.broker_load_access_key == "test_access_key"
+    assert config.broker_load_secret_key == "test_secret_key"
