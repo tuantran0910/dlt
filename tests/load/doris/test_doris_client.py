@@ -588,3 +588,252 @@ def test_doris_broker_load_with_clause_override_credentials_wrong_type() -> None
     assert '"s3.access_key" = "GOOG_HMAC_ACCESS_KEY"' in with_clause
     assert '"s3.secret_key" = "GOOG_HMAC_SECRET_KEY"' in with_clause
     assert '"s3.region" = "auto"' in with_clause
+# ============================================================
+# DorisMergeJob MERGE SQL Generation Tests
+# ============================================================
+
+
+def _extract_update_clause(merge_stmt: str) -> str:
+    """Extract the UPDATE SET clause from a MERGE statement."""
+    import re
+    update_set_match = re.search(
+        r'WHEN MATCHED\s+THEN UPDATE SET\s+(.+?)(?=\s+WHEN NOT MATCHED|$)',
+        merge_stmt,
+        re.DOTALL
+    )
+    if update_set_match:
+        return update_set_match.group(1)
+    return ""
+
+
+def test_doris_merge_job_gen_upsert_merge_sql_excludes_primary_keys() -> None:
+    """Test that gen_upsert_merge_sql excludes primary keys from UPDATE SET clause.
+
+    Doris throws: Only value columns of unique table could be updated.
+    This test ensures that primary key columns are NOT included in the UPDATE clause.
+    """
+    root_table_name = "`db`.`user_events_v5`"
+    staging_root_table_name = "`db_staging`.`user_events_v5`"
+    primary_keys = ["`user_id`"]
+    root_table_column_names = ["`user_id`", "`event_type`", "`timestamp`", "`_dlt_load_id`", "`_dlt_id`"]
+    hard_delete_col = None
+    deleted_cond = None
+
+    sql = DorisMergeJob.gen_upsert_merge_sql(
+        root_table_name,
+        staging_root_table_name,
+        primary_keys,
+        root_table_column_names,
+        hard_delete_col,
+        deleted_cond,
+    )
+
+    assert len(sql) == 1
+    merge_stmt = sql[0]
+
+    # Should contain MERGE INTO
+    assert "MERGE INTO" in merge_stmt
+    # Should use primary key in ON clause
+    assert "ON d.`user_id` = s.`user_id`" in merge_stmt
+
+    # Extract the UPDATE SET clause specifically
+    update_clause = _extract_update_clause(merge_stmt)
+    assert update_clause, "Should have UPDATE SET clause"
+
+    # PRIMARY KEY should NOT be in UPDATE SET clause
+    assert "`user_id` = s.`user_id`" not in update_clause, "user_id (primary key) should not be in UPDATE SET clause"
+
+    # UPDATE SET should only contain non-primary key columns
+    assert "`event_type` = s.`event_type`" in update_clause
+    assert "`timestamp` = s.`timestamp`" in update_clause
+    assert "`_dlt_load_id` = s.`_dlt_load_id`" in update_clause
+    assert "`_dlt_id` = s.`_dlt_id`" in update_clause
+
+
+def test_doris_merge_job_gen_upsert_merge_sql_multiple_primary_keys() -> None:
+    """Test that gen_upsert_merge_sql handles multiple primary keys correctly."""
+    root_table_name = "`db`.`events`"
+    staging_root_table_name = "`db_staging`.`events`"
+    primary_keys = ["`user_id`", "`event_id`"]
+    root_table_column_names = [
+        "`user_id`",
+        "`event_id`",
+        "`event_type`",
+        "`timestamp`",
+    ]
+    hard_delete_col = None
+    deleted_cond = None
+
+    sql = DorisMergeJob.gen_upsert_merge_sql(
+        root_table_name,
+        staging_root_table_name,
+        primary_keys,
+        root_table_column_names,
+        hard_delete_col,
+        deleted_cond,
+    )
+
+    assert len(sql) == 1
+    merge_stmt = sql[0]
+
+    # Both primary keys should be in ON clause
+    assert "d.`user_id` = s.`user_id`" in merge_stmt
+    assert "d.`event_id` = s.`event_id`" in merge_stmt
+
+    # Extract UPDATE SET clause
+    update_clause = _extract_update_clause(merge_stmt)
+
+    # Neither primary key should be in UPDATE SET
+    assert "`user_id` = s.`user_id`" not in update_clause
+    assert "`event_id` = s.`event_id`" not in update_clause
+
+    # Only non-primary key columns should be in UPDATE SET
+    assert "`event_type` = s.`event_type`" in update_clause
+    assert "`timestamp` = s.`timestamp`" in update_clause
+
+
+def test_doris_merge_job_gen_upsert_merge_sql_with_hard_delete() -> None:
+    """Test that gen_upsert_merge_sql handles hard delete column correctly."""
+    root_table_name = "`db`.`user_events_v5`"
+    staging_root_table_name = "`db_staging`.`user_events_v5`"
+    primary_keys = ["`user_id`"]
+    root_table_column_names = ["`user_id`", "`event_type`", "`deleted_at`"]
+    hard_delete_col = "`deleted_at`"
+    deleted_cond = "`deleted_at` IS NOT NULL"
+
+    sql = DorisMergeJob.gen_upsert_merge_sql(
+        root_table_name,
+        staging_root_table_name,
+        primary_keys,
+        root_table_column_names,
+        hard_delete_col,
+        deleted_cond,
+    )
+
+    assert len(sql) == 1
+    merge_stmt = sql[0]
+
+    # Should contain hard delete clause
+    assert "WHEN MATCHED AND s.`deleted_at` IS NOT NULL THEN DELETE" in merge_stmt
+
+    # Extract UPDATE SET clause
+    update_clause = _extract_update_clause(merge_stmt)
+
+    # PRIMARY KEY should NOT be in UPDATE SET clause
+    assert "`user_id` = s.`user_id`" not in update_clause
+
+
+def test_doris_merge_job_gen_upsert_sql_with_table_schema() -> None:
+    """Test gen_upsert_sql with a realistic table schema.
+
+    This is an integration-style test that verifies the full flow from
+    table schema to SQL generation.
+    """
+    from dlt.destinations.impl.doris.doris import DorisClient
+    from dlt.destinations.impl.doris.configuration import DorisClientConfiguration, DorisCredentials
+    from dlt.common.schema import Schema
+
+    # Setup config
+    config = DorisClientConfiguration()
+    config.credentials = DorisCredentials()
+    config.credentials.database = "raw"
+    config.credentials.host = "localhost"
+    config.credentials.port = 9030
+    config.credentials.username = "root"
+    config.create_indexes = True
+
+    # Setup schema
+    schema = Schema("test")
+    capabilities = doris().capabilities()
+    client = DorisClient(schema, config, capabilities)
+
+    # Mock SQL client
+    mock_sql_client = MagicMock()
+    mock_sql_client.dataset_name = "raw"
+    mock_sql_client.staging_dataset_name = "raw_staging"
+    mock_sql_client.escape_column_name = lambda x: f"`{x}`"
+    mock_sql_client.capabilities.escape_literal = lambda x: f"'{x}'" if isinstance(x, str) else str(x)
+
+    # get_qualified_table_names returns a tuple of (table_name, staging_table_name)
+    # The method takes just a name parameter
+    mock_sql_client.get_qualified_table_names = lambda name: (
+        f"`raw`.`{name}`",
+        f"`raw_staging`.`{name}`",
+    )
+
+    mock_sql_client.fully_qualified_dataset_name = lambda _self=None, staging=False: (
+        "`raw_staging`" if staging else "`raw`"
+    )
+
+    # Create table schema with primary key
+    table_schema: PreparedTableSchema = {
+        "name": "user_events_v5",
+        "columns": {
+            "user_id": {"name": "user_id", "data_type": "bigint", "primary_key": True, "nullable": False},
+            "event_type": {"name": "event_type", "data_type": "text", "nullable": True},
+            "timestamp": {"name": "timestamp", "data_type": "timestamp", "nullable": True},
+            "_dlt_load_id": {"name": "_dlt_load_id", "data_type": "text", "nullable": True},
+            "_dlt_id": {"name": "_dlt_id", "data_type": "text", "nullable": True},
+        },
+        "write_disposition": "merge",
+    }
+
+    table_chain = [table_schema]
+
+    # Generate SQL
+    sql = DorisMergeJob.gen_upsert_sql(table_chain, mock_sql_client)
+
+    assert len(sql) == 1
+    merge_stmt = sql[0]
+
+    # Verify the structure
+    assert "MERGE INTO `raw`.`user_events_v5` d" in merge_stmt
+    assert "USING `raw_staging`.`user_events_v5` s" in merge_stmt
+
+    # Primary key should be in ON clause
+    assert "ON d.`user_id` = s.`user_id`" in merge_stmt
+
+    # Extract UPDATE SET clause
+    update_clause = _extract_update_clause(merge_stmt)
+
+    # Primary key should NOT be in UPDATE SET
+    assert "`user_id` = s.`user_id`" not in update_clause
+
+    # Non-primary key columns should be in UPDATE SET
+    assert "`event_type` = s.`event_type`" in update_clause
+    assert "`timestamp` = s.`timestamp`" in update_clause
+
+
+def test_doris_merge_job_gen_upsert_merge_sql_no_update_columns() -> None:
+    """Test that gen_upsert_merge_sql handles the case where all columns are primary keys.
+
+    In this case, the UPDATE SET clause should be empty, and we should only have
+    WHEN NOT MATCHED ... INSERT.
+    """
+    root_table_name = "`db`.`pk_only`"
+    staging_root_table_name = "`db_staging`.`pk_only`"
+    primary_keys = ["`id`", "`id2`"]
+    root_table_column_names = ["`id`", "`id2`"]
+    hard_delete_col = None
+    deleted_cond = None
+
+    sql = DorisMergeJob.gen_upsert_merge_sql(
+        root_table_name,
+        staging_root_table_name,
+        primary_keys,
+        root_table_column_names,
+        hard_delete_col,
+        deleted_cond,
+    )
+
+    assert len(sql) == 1
+    merge_stmt = sql[0]
+
+    # Should still have MERGE INTO
+    assert "MERGE INTO" in merge_stmt
+    assert "ON" in merge_stmt
+
+    # Should NOT have WHEN MATCHED ... UPDATE (no columns to update)
+    # Should only have WHEN NOT MATCHED ... INSERT
+    assert "WHEN MATCHED" not in merge_stmt or "THEN UPDATE SET" not in merge_stmt
+    assert "WHEN NOT MATCHED" in merge_stmt

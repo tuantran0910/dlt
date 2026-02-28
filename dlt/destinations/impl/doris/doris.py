@@ -413,6 +413,156 @@ class DorisMergeJob(SqlMergeFollowupJob):
             root_table_name, staging_root_table_name, key_clauses, for_delete
         )
 
+    @classmethod
+    def gen_upsert_sql(
+        cls, table_chain: Sequence[PreparedTableSchema], sql_client: Any
+    ) -> List[str]:
+        """Override to exclude primary/merge keys from MERGE INTO ... UPDATE SET clause.
+        Doris throws: Only value columns of unique table could be updated.
+        """
+        from dlt.common.schema.utils import get_columns_names_with_prop
+        from dlt.common.destination import DestinationCapabilitiesContext
+
+        sql: List[str] = []
+        root_table = table_chain[0]
+        root_table_name, staging_root_table_name = sql_client.get_qualified_table_names(
+            root_table["name"]
+        )
+        escape_column_id = sql_client.escape_column_name
+        escape_lit = sql_client.capabilities.escape_literal
+        if escape_lit is None:
+            escape_lit = DestinationCapabilitiesContext.generic_capabilities().escape_literal
+
+        # process table hints
+        primary_keys = cls._escape_list(
+            get_columns_names_with_prop(root_table, "primary_key"),
+            escape_column_id,
+        )
+        hard_delete_col, deleted_cond = cls._get_hard_delete_col_and_cond(
+            root_table,
+            escape_column_id,
+            escape_lit,
+        )
+
+        # generate merge statement for root table
+        root_table_column_names = list(map(escape_column_id, root_table["columns"]))
+        sql.extend(
+            cls.gen_upsert_merge_sql(
+                root_table_name,
+                staging_root_table_name,
+                primary_keys,
+                root_table_column_names,
+                hard_delete_col,
+                deleted_cond,
+            )
+        )
+
+        # generate statements for nested tables if they exist
+        nested_tables = table_chain[1:]
+        if nested_tables:
+            root_row_key_column = escape_column_id(
+                cls.get_row_key_col(
+                    table_chain,
+                    root_table,
+                    sql_client.fully_qualified_dataset_name(),
+                    sql_client.fully_qualified_dataset_name(staging=True),
+                )
+            )
+            for table in nested_tables:
+                nested_row_key_column = escape_column_id(
+                    cls.get_row_key_col(
+                        table_chain,
+                        table,
+                        sql_client.fully_qualified_dataset_name(),
+                        sql_client.fully_qualified_dataset_name(staging=True),
+                    )
+                )
+                root_key_column = escape_column_id(
+                    cls.get_root_key_col(
+                        table_chain,
+                        table,
+                        sql_client.fully_qualified_dataset_name(),
+                        sql_client.fully_qualified_dataset_name(staging=True),
+                    )
+                )
+                table_name, staging_table_name = sql_client.get_qualified_table_names(table["name"])
+
+                # delete records for elements no longer in the list
+                sql.append(f"""
+                    DELETE FROM {table_name}
+                    WHERE {root_key_column} IN (SELECT {root_row_key_column} FROM {staging_root_table_name})
+                    AND {nested_row_key_column} NOT IN (SELECT {nested_row_key_column} FROM {staging_table_name});
+                """)
+
+                # insert records for new elements in the list
+                table_column_names = list(map(escape_column_id, table["columns"]))
+                # Doris Cannot update nested_row_key_column because it's part of the UNIQUE KEY (primary key)
+                update_columns = [c for c in table_column_names if c != nested_row_key_column]
+                update_str = ", ".join([c + " = " + "s." + c for c in update_columns])
+                col_str = ", ".join(["{alias}" + c for c in table_column_names])
+
+                # If there are no columns to update, we must fallback to NOT MATCHED ... INSERT only
+                when_matched = ""
+                if update_str:
+                    when_matched = f"WHEN MATCHED THEN UPDATE SET {update_str}"
+
+                sql.append(f"""
+                    MERGE INTO {table_name} d USING {staging_table_name} s
+                    ON d.{nested_row_key_column} = s.{nested_row_key_column}
+                    {when_matched}
+                    WHEN NOT MATCHED
+                        THEN INSERT ({col_str.format(alias="")}) VALUES ({col_str.format(alias="s.")});
+                """)
+
+                # delete hard-deleted records
+                if hard_delete_col is not None:
+                    sql.append(f"""
+                        DELETE FROM {table_name}
+                        WHERE {root_key_column} IN (
+                            SELECT {root_row_key_column}
+                            FROM {staging_root_table_name}
+                            WHERE {deleted_cond}
+                        );
+                    """)
+        return sql
+
+    @classmethod
+    def gen_upsert_merge_sql(
+        cls,
+        root_table_name: str,
+        staging_root_table_name: str,
+        primary_keys: Sequence[str],
+        root_table_column_names: Sequence[str],
+        hard_delete_col: Optional[str],
+        deleted_cond: Optional[str],
+    ) -> List[str]:
+        """Generate MERGE statement for upsert on root table, excluding primary keys from UPDATE."""
+        sql: List[str] = []
+        on_str = " AND ".join([f"d.{c} = s.{c}" for c in primary_keys])
+
+        # Doris throws: Only value columns of unique table could be updated.
+        # So we filter out the primary keys from the update clause.
+        update_columns = [c for c in root_table_column_names if c not in primary_keys]
+        update_str = ", ".join([c + " = " + "s." + c for c in update_columns])
+        col_str = ", ".join(["{alias}" + c for c in root_table_column_names])
+        delete_str = (
+            "" if hard_delete_col is None else f"WHEN MATCHED AND s.{deleted_cond} THEN DELETE"
+        )
+
+        when_matched = ""
+        if update_str:
+            when_matched = f"WHEN MATCHED THEN UPDATE SET {update_str}"
+
+        sql.append(f"""
+            MERGE INTO {root_table_name} d USING {staging_root_table_name} s
+            ON {on_str}
+            {delete_str}
+            {when_matched}
+            WHEN NOT MATCHED
+                THEN INSERT ({col_str.format(alias="")}) VALUES ({col_str.format(alias="s.")});
+        """)
+        return sql
+
 
 class DorisSqlClient(SqlalchemyClient):
     def truncate_tables(self, *tables: str) -> None:
@@ -550,7 +700,6 @@ class DorisClient(InsertValuesJobClient, SqlalchemyJobClient, SupportsStagingDes
                 self.schema.stored_version_hash,
                 schema_info.inserted_at,
             )
-            return {}
         else:
             logger.info(
                 "Schema with hash %s not found in storage, upgrading",
